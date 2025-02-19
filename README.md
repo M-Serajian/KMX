@@ -1,8 +1,9 @@
-# GPU-CSR-KMER: GPU-Accelerated Compressed K-mer Matrix Generator
+
+# Gerbil-DataFrame: GPU-Accelerated K-mer Processing
 
 ## Introduction
 
-GPU-CSR-KMER is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets. Given a list of genomes in FASTA or FASTQ format, it:
+Gerbil-DataFrame is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets. Given a list of genomes in FASTA or FASTQ format, it:
 
 - Extracts k-mers from each genome.
 - Constructs a CSR (Compressed Sparse Row) matrix, where rows represent genomes and columns represent extracted k-mers.
@@ -13,21 +14,18 @@ GPU-CSR-KMER is a GPU-accelerated software designed for efficient k-mer extracti
 
 ### Required Software
 
-| Dependency | Purpose                                              | Notes                                              |
 
-|------------|------------------------------------------------------|----------------------------------------------------|
-
-| GCC        | Required for compilation                             | Available in most Linux distributions             |
-
-| CMake      | Build system for generating Makefiles                | Version 3.10 or higher is recommended             |
-
-| Boost      | Required for optimized performance                   | Must include system, thread, filesystem, and regex |
+| Dependency                        | Purpose                               | Notes                                                                         |
+| --------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------- |
+| `GCC` (GNU Compiler Collection) | Required for compilation              | Must be available in the system or loaded via modules                         |
+| `CMake`                         | Build system for generating Makefiles | Should be version 3.10+                                                       |
+| `Boost`                         | Required for optimized performance    | Must include `system`, `thread`, `filesystem`, and `regex` components |
 
 ### HPC-Specific Requirements
 
-If you are using Gerbil-DataFrame in an HPC environment, ensure that module loading is available (for example):
+If you are using Gerbil-DataFrame in an HPC environment, ensure that module loading is available:
 
-```
+```bash
 
 ml gcc
 
@@ -45,7 +43,7 @@ Gerbil-DataFrame provides an automated installation script that handles dependen
 
 1. Clone the repository:
 
-   ```
+   ```bash
 
    git clone https://github.com/M-Serajian/gerbil-DataFrame.git
 
@@ -54,7 +52,7 @@ Gerbil-DataFrame provides an automated installation script that handles dependen
    ```
 2. Run the installation script:
 
-   ```
+   ```bash
 
    sh setup.sh
 
@@ -63,12 +61,12 @@ Gerbil-DataFrame provides an automated installation script that handles dependen
    This will:
 
    - Check for required dependencies (GCC, CMake, Boost).
-   - Load dependencies via ml (for HPC environments).
+   - Load dependencies via `ml` (for HPC environments).
    - Clone and initialize submodules.
-   - Compile the software in the build/ directory.
+   - Compile the software in the `build/` directory.
 3. Force reinstallation (if needed):
 
-   ```
+   ```bash
 
    sh setup.sh --force
 
@@ -82,9 +80,9 @@ For systems where the automated script is not preferred, use the following steps
 
 1. Install dependencies.
 
-   For Ubuntu/Debian:
+   **For Ubuntu/Debian:**
 
-   ```
+   ```bash
 
    sudo apt update
 
@@ -92,9 +90,9 @@ For systems where the automated script is not preferred, use the following steps
 
    ```
 
-   For CentOS/RHEL:
+   **For CentOS/RHEL:**
 
-   ```
+   ```bash
 
    sudo yum groupinstall -y "Development Tools"
 
@@ -103,7 +101,7 @@ For systems where the automated script is not preferred, use the following steps
    ```
 2. Clone the repository:
 
-   ```
+   ```bash
 
    git clone https://github.com/M-Serajian/gerbil-DataFrame.git
 
@@ -112,7 +110,7 @@ For systems where the automated script is not preferred, use the following steps
    ```
 3. Initialize submodules:
 
-   ```
+   ```bash
 
    git submodule init
 
@@ -121,7 +119,7 @@ For systems where the automated script is not preferred, use the following steps
    ```
 4. Build the software:
 
-   ```
+   ```bash
 
    mkdir -p include/gerbil-DataFrame/build
 
@@ -134,7 +132,7 @@ For systems where the automated script is not preferred, use the following steps
    ```
 5. Verify the installation:
 
-   ```
+   ```bash
 
    ls -l include/gerbil-DataFrame/build/
 
@@ -144,14 +142,14 @@ For systems where the automated script is not preferred, use the following steps
 
 1. Navigate to the build directory:
 
-   ```
+   ```bash
 
    cd include/gerbil-DataFrame/build
 
    ```
 2. Run the program:
 
-   ```
+   ```bash
 
    ./gerbil [OPTIONS]
 
@@ -159,43 +157,43 @@ For systems where the automated script is not preferred, use the following steps
 
 ### Example
 
-```
+```bash
 
-./gerbil --input genome.fasta --kmer-size 31 --output kmers.csr
+./gerbil--inputgenome.fasta--kmer-size31--outputkmers.csr
 
 ```
 
 ### Command-Line Options
 
-| Option       | Description                                          |
+| Option       | Description |
 
-|------------- |------------------------------------------------------|
+|-------------|-------------|
 
-| --input      | Path to the input genome file (FASTA/FASTQ)          |
+| `--input`   | Path to the input genome file (FASTA/FASTQ) |
 
-| --kmer-size  | Length of k-mers to extract                          |
+| `--kmer-size` | Length of k-mers to extract |
 
-| --output     | Path to save the generated CSR matrix               |
+| `--output`  | Path to save the generated CSR matrix |
 
 For more options, run:
 
-```
+```bash
 
-./gerbil --help
+./gerbil--help
 
 ```
 
 ## Troubleshooting
 
-| Issue                                                   | Solution                                                                                |
+| Issue | Solution |
 
-|---------------------------------------------------------|-----------------------------------------------------------------------------------------|
+|-------|----------|
 
-| CMake Error: Could NOT find Boost                       | Ensure Boost is installed and correctly loaded (via ml boost for HPC or apt/yum for Linux). |
+| `CMake Error: Could NOT find Boost` | Ensure Boost is installed and correctly loaded (`ml boost` for HPC or `apt/yum` for Linux). |
 
-| fatal: 'include/gerbil-DataFrame' already exists in the index | Run `sh setup.sh --force` to fully remove and reinstall the software.                     |
+| `fatal: 'include/gerbil-DataFrame' already exists in the index` | Run `sh setup.sh --force` to fully remove and reinstall the software. |
 
-| make: command not found                                 | Install build-essential (Ubuntu/Debian) or Development Tools (CentOS/RHEL).              |
+| `make: command not found` | Install `build-essential` (Ubuntu/Debian) or `Development Tools` (CentOS/RHEL). |
 
 ## License
 
@@ -203,4 +201,4 @@ This project is released under the [MIT License](LICENSE).
 
 ## Contact
 
-For questions or support, contact [Your Name] at [Your Email], or open an issue on GitHub.
+For questions or support, contact **[Your Name]** at **[Your Email]**, or open an issue on GitHub.
