@@ -1,64 +1,56 @@
-import subprocess
+import cudf
+import cupy as cp
 import os
+import subprocess
 
-GREEN = "\033[92m"
-RED = "\033[91m"
-RESET = "\033[0m"
 
-def set_of_all_unique_kmers_extractor(args,set_of_all_unique_kmers_dir):
-    """Run the gerbil-DataFrame command with the parsed arguments."""
-    
-
+def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory):
+    """Run the gerbil-DataFrame tool to extract unique k-mers from the given genome file."""
     command = [
         "./include/gerbil-DataFrame/build/gerbil",
-        "-k", str(args.kmer_size),
+        "-k", str(kmer_length),
         "-o", "csv",
-        "-l", str(args.min),
-        "-z", str(args.max),
+        "-l", str(min_threshold),
+        "-z", str(max_threshold),
         "-g",
         "-d",
-        args.genome_list,
-        args.tmp,
-        set_of_all_unique_kmers_dir
+        genome_file,
+        temp_directory,
+        output_directory
     ]
-
+    
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True)
-        print(f"{GREEN} The list of all unique k-mers is stored here: {set_of_all_unique_kmers_dir}{RESET}")
-    except subprocess.CalledProcessError as e:
-        print(f"{RED}Error: set_of_all_unique_kmers_extractor failed with return code {e.returncode}.{RESET}")
-        print(f"{RED}Standard Output:\n{e.stdout}{RESET}")
-        print(f"{RED}Standard Error:\n{e.stderr}{RESET}")
-    except FileNotFoundError:
-        print(f"{RED}Error: The executable './include/gerbil-DataFrame/build/gerbil' was not found.{RESET}")
+        print(f"Unique k-mers successfully extracted and stored at: {output_directory}")
+    except subprocess.CalledProcessError as error:
+        print(f"Error: Extraction of unique k-mers failed with return code {error.returncode}.")
+        print(f"Standard Output:\n{error.stdout}")
+        print(f"Standard Error:\n{error.stderr}")
 
 
 
 
-
-
-def single_genome_kmer_extractor(args,genome_dir,genome_number):
-    """Run the gerbil-DataFrame command with the parsed arguments."""
+def single_genome_kmer_extractor(kmer_size, tmp_dir, genome_dir, genome_number):
+    """Extract k-mers from a single genome using the gerbil-DataFrame tool."""
+    output_file = os.path.join(tmp_dir, f"temporary_output_genome_{genome_number}.csv")
     
-
-    
-    #output directory
-    tmp_dir = os.path.join(args.tmp, f"temporary_output_genome_{genome_number}.csv")
-
-
     command = [
         "./include/gerbil-DataFrame/build/gerbil",
-        "-k", str(args.kmer_size),
+        "-k", str(kmer_size),
         "-o", "csv",
         "-l", str(1),
-        "-z", str(10**9),           #infinity
+        "-z", str(10**9),  # Infinity
         "-g",
         "-d",
         genome_dir,
-        args.tmp,
-        tmp_dir
+        tmp_dir,
+        output_file
     ]
-
+    
     result = subprocess.run(command, check=True, text=True, capture_output=True)
+    
+    return output_file
 
-    return(tmp_dir)
+
+
+
