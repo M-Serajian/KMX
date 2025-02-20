@@ -146,4 +146,3 @@ fi
 # Return to the main directory
 cd ../../..
 
-echo -e "${GREEN}Setup completed successfully.${NC}"
