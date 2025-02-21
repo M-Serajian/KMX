@@ -70,5 +70,7 @@ def create_csr_matrix(genome_list, kmer_size, min_val=1, max_val=10**9, tmp_dir=
             print(f"Processed {genome_num} genomes", flush=True)
     
     last_value = row[-1]
-    print("Final k-mer frequency matrix:")
-    print(set_of_all_unique_kmers_dataframe.reset_index())
+    
+    df_comp = set_of_all_unique_kmers_dataframe.reset_index()
+
+    return data,column,row,df_comp
