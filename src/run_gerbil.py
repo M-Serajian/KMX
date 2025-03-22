@@ -1,10 +1,8 @@
-import cudf
-import cupy as cp
 import os
 import subprocess
 
 
-def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory):
+def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory, disable_normalization=False):
     """Run the gerbil-DataFrame tool to extract unique k-mers from the given genome file."""
     command = [
         "./include/gerbil-DataFrame/build/gerbil",
@@ -13,11 +11,13 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
         "-l", str(min_threshold),
         "-z", str(max_threshold),
         "-g",
-        "-d",
-        genome_file,
-        temp_directory,
-        output_directory
     ]
+    
+    # Add the -d flag if disable_normalization is True
+    if disable_normalization:
+        command.append("-d")
+    
+    command.extend([genome_file, temp_directory, output_directory])
     
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True)
@@ -28,11 +28,8 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
         print(f"Standard Error:\n{error.stderr}")
 
 
-
-
-def single_genome_kmer_extractor(kmer_size, tmp_dir, genome_dir, genome_number):
+def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, genome_number, disable_normalization=False):
     """Extract k-mers from a single genome using the gerbil-DataFrame tool."""
-    output_file = os.path.join(tmp_dir, f"temporary_output_genome_{genome_number}.csv")
     
     command = [
         "./include/gerbil-DataFrame/build/gerbil",
@@ -41,16 +38,14 @@ def single_genome_kmer_extractor(kmer_size, tmp_dir, genome_dir, genome_number):
         "-l", str(1),
         "-z", str(10**9),  # Infinity
         "-g",
-        "-d",
-        genome_dir,
-        tmp_dir,
-        output_file
     ]
+    
+    # Add the -d flag if disable_normalization is True
+    if disable_normalization:
+        command.append("-d")
+    
+    command.extend([genome_dir, tmp_dir, output_file])
     
     result = subprocess.run(command, check=True, text=True, capture_output=True)
     
     return output_file
-
-
-
-

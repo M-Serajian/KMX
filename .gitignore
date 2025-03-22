@@ -174,3 +174,13 @@ cython_debug/
 data/*
 tmp/*
 temp/*
+logs/*
+debug/
+scripts/
+
+
+
+slurm_simone.sh
+slurm_christina.sh
+run.sh
+rmm_log.txt
