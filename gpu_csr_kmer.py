@@ -4,6 +4,48 @@ import cudf
 import cupy as cp
 import time
 import datetime
+import gc
+import threading
+from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+
+
+
+# Event to stop the memory monitor thread
+stop_event = threading.Event()
+
+class GPUMemoryMonitor:
+    def __init__(self, interval=1.0):
+        """
+        Tracks peak GPU memory usage over time using CuPy.
+        Args:
+            interval (float): Time between samples in seconds.
+        """
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._monitor, daemon=True)
+        self._peak_used_bytes = 0
+
+    def _monitor(self):
+        while not self._stop_event.is_set():
+            try:
+                free, total = cp.cuda.runtime.memGetInfo()
+                used = total - free
+                self._peak_used_bytes = max(self._peak_used_bytes, used)
+                time.sleep(self.interval)
+            except Exception:
+                break
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join()
+
+    def get_peak_memory_GB(self):
+        return self._peak_used_bytes / (1024 ** 3)
+
+
 # Get the absolute path of the project root
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
@@ -11,8 +53,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 from args import parse_arguments
 from src.create_csr_matrix import create_csr_matrix
 
-# Cleaning memory
-import gc
+
 
 device = cp.cuda.Device(0)
 
@@ -33,18 +74,28 @@ print(f"Free memorry: {free_mem}")
 
 total_gpu_memory = device.mem_info[1]
 
-pool_size = int(total_gpu_memory * 0.8) // 256 * 256
 
-# Reinitialize RMM with the calculated pool size
-rmm.reinitialize(
-    pool_allocator=True,  # Enable the memory pool
-    initial_pool_size=pool_size  # Set the pool size
-)
 
-cp.get_default_memory_pool().free_all_blocks()
-gc.collect()
+# pool_size = int(total_gpu_memory * 0.9) // 256 * 256
+
+# # Reinitialize RMM with the calculated pool size
+# rmm.reinitialize(
+#     pool_allocator=True,  # Enable the memory pool
+#     initial_pool_size=pool_size  # Set the pool size
+# )
+
+
+
+
 
 if __name__ == "__main__":
+    cp.get_default_memory_pool().free_all_blocks()
+    gc.collect()
+    time.sleep(1)
+    # Start GPU memory monitor
+    monitor = GPUMemoryMonitor(interval=1.0)
+    monitor.start()
+
     args = parse_arguments()
 
     # Start the timer before executing the function
@@ -62,6 +113,13 @@ if __name__ == "__main__":
     elapsed_time = t1 - t0
     formatted_time = str(datetime.timedelta(seconds=elapsed_time))
 
+
+    # Stop the memory monitor
+    monitor.stop()
+
+    peak_used = monitor.get_peak_memory_GB()
+
+
     output_text = (
         f"The sparsity of the genome k-mer matrix is: {sparsity}%\n"
         f"K-mer size: {args.kmer_size}\n"
@@ -70,7 +128,7 @@ if __name__ == "__main__":
         f"Max value: {args.max}\n"
         f"-d flag activated: {'Yes! Normalization disabled.' if args.disable_normalization else 'No! Normalization enabled.'}\n"
         f"Processing time is: {formatted_time} .\n"
-
+        f"Peak GPU memory used (pynvml): {peak_used:.2f} GB\n"
     )
 
 

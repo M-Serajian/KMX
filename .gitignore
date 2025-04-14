@@ -184,3 +184,9 @@ slurm_simone.sh
 slurm_christina.sh
 run.sh
 rmm_log.txt
+
+# Ignore all .sh files
+*.sh
+
+# But do not ignore setup.sh
+!setup.sh
