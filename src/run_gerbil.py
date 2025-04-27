@@ -1,11 +1,18 @@
 import os
 import subprocess
 
+# Find the directory where run_gerbil.py is located
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+print(CURRENT_DIR)
+# Move two levels up (from src/ -> GPU_CSR_Kmer/ -> include/gerbil-DataFrame/build/gerbil)
+GERBIL_EXECUTABLE = os.path.join(CURRENT_DIR, '..', 'include', 'gerbil-DataFrame', 'build', 'gerbil')
+GERBIL_EXECUTABLE = os.path.abspath(GERBIL_EXECUTABLE)
+
 
 def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory, disable_normalization=False, enable_gpu=True):
     """Run the gerbil-DataFrame tool to extract unique k-mers from the given genome file."""
     command = [
-        "./include/gerbil-DataFrame/build/gerbil",
+        GERBIL_EXECUTABLE,
         "-k", str(kmer_length),
         "-o", "csv",
         "-l", str(min_threshold),
@@ -33,7 +40,7 @@ def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, di
     """Extract k-mers from a single genome using the gerbil-DataFrame tool."""
     
     command = [
-        "./include/gerbil-DataFrame/build/gerbil",
+        GERBIL_EXECUTABLE,
         "-k", str(kmer_size),
         "-o", "csv",
         "-l", str(1),
