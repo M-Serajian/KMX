@@ -28,7 +28,7 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
         print(f"Standard Error:\n{error.stderr}")
 
 
-def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, genome_number, disable_normalization=False):
+def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, disable_normalization=False):
     """Extract k-mers from a single genome using the gerbil-DataFrame tool."""
     
     command = [

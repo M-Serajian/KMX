@@ -67,7 +67,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
             f"{'normalization_disabled' if disable_normalization else 'normalization_enabled'}.csv"
         )
 
-        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, genome_number, disable_normalization)
+        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, disable_normalization)
         df_csv = cudf.read_csv(tmp_genome_output_dir)
         #removing the temporary file
         os.remove(tmp_genome_output_dir)
@@ -93,7 +93,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
         current_position += size
         row.append(current_position)
 
-        if genome_number % 1000 == 0 and genome_number != 0:
+        if genome_number % 2000 == 0 and genome_number != 0:
             print(f"Processed {genome_number} genomes", flush=True)
             # density=round (100*current_position/(len(set_of_all_unique_kmers_dataframe)*genome_number+1),2)
             # print(f"Current density is : {density}%",flush=True)
