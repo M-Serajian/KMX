@@ -177,7 +177,7 @@ temp/*
 logs/*
 debug/
 scripts/
-
+test/
 
 
 slurm_simone.sh

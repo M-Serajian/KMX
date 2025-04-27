@@ -108,7 +108,8 @@ if __name__ == "__main__":
         tmp_dir=args.tmp,
         min_val=args.min,
         max_val=args.max,
-        disable_normalization=args.disable_normalization 
+        disable_normalization=args.disable_normalization,
+        enable_gpu=not(args.cpu)  
     )
     t1=time.time()
     elapsed_time = t1 - t0
@@ -128,6 +129,7 @@ if __name__ == "__main__":
         f"Min value: {args.min}\n"
         f"Max value: {args.max}\n"
         f"-d flag activated: {'Yes! Normalization disabled.' if args.disable_normalization else 'No! Normalization enabled.'}\n"
+        f"-c flag activated: {'Yes! GPU acceleration disabled.' if args.cpu else 'No! GPU acceleration enabled.'}\n"
         f"Processing time is: {formatted_time} .\n"
         f"Peak GPU memory used (pynvml): {peak_used:.2f} GB\n"
     )

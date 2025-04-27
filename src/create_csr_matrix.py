@@ -22,7 +22,7 @@ def expand_array(array, new_size):
 #     return expanded_array
 
 
-def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9, disable_normalization=False, enable_gpu=True):
+def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9, disable_normalization=False, enable_gpu=False):
 
     """Processes genome data and generates a Compressed Sparse Row (CSR) matrix representation."""
     
@@ -34,7 +34,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
     )
     
     # Extract unique k-mers for the provided genome list
-    set_of_all_unique_kmers_extractor(genome_list, set_of_all_unique_kmers_dir, kmer_size, min_val, max_val, tmp_dir, disable_normalization)
+    set_of_all_unique_kmers_extractor(genome_list, set_of_all_unique_kmers_dir, kmer_size, min_val, max_val, tmp_dir, disable_normalization,enable_gpu)
 
     # Load extracted k-mers into a cuDF DataFrame
     set_of_all_unique_kmers_dataframe = cudf.read_csv(set_of_all_unique_kmers_dir)
@@ -67,7 +67,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
             f"{'normalization_disabled' if disable_normalization else 'normalization_enabled'}.csv"
         )
 
-        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, disable_normalization)
+        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, disable_normalization, enable_gpu)
         df_csv = cudf.read_csv(tmp_genome_output_dir)
         #removing the temporary file
         os.remove(tmp_genome_output_dir)
@@ -93,7 +93,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
         current_position += size
         row.append(current_position)
 
-        if genome_number % 2000 == 0 and genome_number != 0:
+        if genome_number % 1000 == 0 and genome_number != 0:
             print(f"Processed {genome_number} genomes", flush=True)
             # density=round (100*current_position/(len(set_of_all_unique_kmers_dataframe)*genome_number+1),2)
             # print(f"Current density is : {density}%",flush=True)

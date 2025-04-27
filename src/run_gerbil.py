@@ -2,19 +2,18 @@ import os
 import subprocess
 
 
-def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory, disable_normalization=False,enable_gpu=True):
+def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory, disable_normalization=False, enable_gpu=True):
     """Run the gerbil-DataFrame tool to extract unique k-mers from the given genome file."""
     command = [
         "./include/gerbil-DataFrame/build/gerbil",
         "-k", str(kmer_length),
         "-o", "csv",
         "-l", str(min_threshold),
-        "-z", str(max_threshold)
-    ]
-
+        "-z", str(max_threshold)]
+    
     if enable_gpu:
         command.append("-g")
-
+    
     # Add the -d flag if disable_normalization is True
     if disable_normalization:
         command.append("-d")
@@ -30,7 +29,7 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
         print(f"Standard Error:\n{error.stderr}")
 
 
-def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, disable_normalization=False,enable_gpu=True):
+def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, disable_normalization=False, enable_gpu=True):
     """Extract k-mers from a single genome using the gerbil-DataFrame tool."""
     
     command = [
@@ -38,9 +37,9 @@ def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, di
         "-k", str(kmer_size),
         "-o", "csv",
         "-l", str(1),
-        "-z", str(10**9)  # Infinity
-    ]
-
+        "-z", str(10**9)]
+    
+    
     if enable_gpu:
         command.append("-g")
 

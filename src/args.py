@@ -91,6 +91,9 @@ def parse_arguments():
                              "are considered as different k-mers. If normalization is enabled (default), both k-mer and "
                              "its reverse complement are mapped to the same k-mer.")
 
+    parser.add_argument("-c", "--cpu", action="store_true", default=False,
+                        help="Force CPU mode. If not specified, GPU acceleration is enabled by default.")
+
     parser.add_argument("-o", "--output", type=check_output_directory, required=True,
                         help="Path to the output directory where results will be stored (required).")
 
