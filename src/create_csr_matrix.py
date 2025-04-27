@@ -22,7 +22,7 @@ def expand_array(array, new_size):
 #     return expanded_array
 
 
-def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9, disable_normalization=False):
+def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9, disable_normalization=False, enable_gpu=True):
 
     """Processes genome data and generates a Compressed Sparse Row (CSR) matrix representation."""
     
