@@ -178,7 +178,7 @@ logs/*
 debug/
 scripts/
 test/
-
+trashcan/
 
 slurm_simone.sh
 slurm_christina.sh
