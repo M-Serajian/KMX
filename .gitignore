@@ -179,7 +179,7 @@ debug/
 scripts/
 test/
 trashcan/
-
+bash_scripts/
 slurm_simone.sh
 slurm_christina.sh
 run.sh
