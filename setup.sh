@@ -9,25 +9,8 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No color
 
-# Check if script is run with --force
-FORCE_INSTALL=false
-if [[ "$1" == "--force" ]]; then
-    FORCE_INSTALL=true
-    echo -e "${RED}Forcing reinstallation... Removing existing submodule.${NC}"
-    
-    # Deinitialize and remove the submodule properly
-    git submodule deinit -f include/gerbil-DataFrame
-    rm -rf .git/modules/include/gerbil-DataFrame
-    git rm -f include/gerbil-DataFrame
-    rm -rf include/gerbil-DataFrame
-
-    # Ensure changes are committed before re-adding
-    git add .gitmodules || true
-    git commit -m "Removed gerbil-DataFrame submodule" || true
-fi
-
 # Check if the software is already installed
-if [ -f "include/gerbil-DataFrame/build/gerbil" ] && [ "$FORCE_INSTALL" = false ]; then
+if [ -f "include/gerbil-DataFrame/build/gerbil" ]; then
     echo -e "${BLUE}The software is already installed.${NC}"
     exit 0
 fi
@@ -85,16 +68,16 @@ fi
 
 # Check Boost (Only Load It, No Searching)
 if $USE_MODULES; then
-    echo -e "${RED}Boost not found. Trying to load module using 'ml boost'...${NC}"
-    if ml boost; then
-        echo -e "${GREEN}Successfully loaded Boost via 'ml boost'.${NC}"
+    echo -e "${RED}Boost 1.77 not found. Trying to load module using 'ml boost/1.77'...${NC}"
+    if ml boost/1.77; then
+        echo -e "${GREEN}Successfully loaded Boost 1.77 via 'ml boost/1.77'.${NC}"
     else
-        echo -e "${RED}Error: Could not load Boost via 'ml boost'.${NC}"
-        MISSING_TOOLS+=("boost")
+        echo -e "${RED}Error: Could not load Boost 1.77 via 'ml boost/1.77'.${NC}"
+        MISSING_TOOLS+=("boost 1.77")
     fi
 else
-    echo -e "${RED}Error: Boost is not installed. Please install it before running the setup.${NC}"
-    MISSING_TOOLS+=("boost")
+    echo -e "${RED}Error: Boost 1.77 is not installed. Please install it before running the setup.${NC}"
+    MISSING_TOOLS+=("boost 1.77")
 fi
 
 # If any tools are missing, exit
@@ -108,9 +91,16 @@ echo -e "${GREEN}All required dependencies are installed or loaded. Proceeding w
 # Ensure the include directory exists
 mkdir -p include
 
-# Add the submodule only if it does not exist
-if [ ! -d "include/gerbil-DataFrame" ]; then
-    echo -e "${GREEN}Adding the submodule gerbil-DataFrame to include/ directory...${NC}"
+# Handle submodule registration
+if git ls-files --stage include/gerbil-DataFrame &>/dev/null; then
+    echo -e "${BLUE}Submodule 'gerbil-DataFrame' is already registered in Git.${NC}"
+else
+    if [ -d "include/gerbil-DataFrame" ]; then
+        echo -e "${RED}Directory 'include/gerbil-DataFrame' exists but is not a registered submodule. Removing it...${NC}"
+        rm -rf include/gerbil-DataFrame
+    fi
+
+    echo -e "${GREEN}Adding the submodule 'gerbil-DataFrame' to include/ directory...${NC}"
     git submodule add https://github.com/M-Serajian/gerbil-DataFrame.git include/gerbil-DataFrame
 fi
 
@@ -126,6 +116,7 @@ mkdir -p build
 cd build
 
 echo "Running CMake..."
+
 # Run CMake
 if cmake ..; then
     echo -e "${GREEN}CMake configuration completed successfully.${NC}"
@@ -133,6 +124,7 @@ else
     echo -e "${RED}Error: CMake configuration failed.${NC}"
     exit 1
 fi
+
 
 # Build the project
 echo "Running make..."
@@ -145,4 +137,5 @@ fi
 
 # Return to the main directory
 cd ../../..
+
 
