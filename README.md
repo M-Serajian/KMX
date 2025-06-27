@@ -1,9 +1,8 @@
-
-# Gerbil-DataFrame: GPU-Accelerated K-mer Processing
+# KMX
 
 ## Introduction
 
-Gerbil-DataFrame is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets. Given a list of genomes in FASTA or FASTQ format, it:
+KMX is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets. Given a list of genomes in FASTA or FASTQ format, it:
 
 - Extracts k-mers from each genome.
 - Constructs a CSR (Compressed Sparse Row) matrix, where rows represent genomes and columns represent extracted k-mers.
