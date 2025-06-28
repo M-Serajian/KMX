@@ -25,6 +25,8 @@ If you use **KMX** in your research, please cite the paper below (replace the pl
 - `cmake` (module: `cmake`, latest)
 - `boost` (module: `boost/1.77`, recommended)
 - `rapidsai` (module: `rapidsai/24.08`, recommended)
+- `rapidsai` (module: `rapidsai/24.08`, recommended)
+- `python` (module: `python/3.8`, recommended)
 - `git`
 - `libboost-all-dev`
 - `libz3-dev`
@@ -35,6 +37,7 @@ If you use **KMX** in your research, please cite the paper below (replace the pl
 ```bash
 ml gcc/12.2
 ml cmake
+ml python/3.8
 ml boost/1.77
 ml rapidsai/24.08
 ```
