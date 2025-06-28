@@ -3,12 +3,19 @@
 
 ## Introduction
 
-KMX is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets and construction of the corresponding matrix. Given a list of genomes in FASTA or FASTQ format, it:
+KMX is a GPU-accelerated software designed for efficient k-mer extraction from large genomic datasets and construction of the corresponding matrix. Given a list of genomes in FASTA format, it:
 
 - Extracts k-mers from each genome.
 - Constructs a CSR (Compressed Sparse Row) matrix, where rows represent genomes and columns represent extracted k-mers.
 - Optimizes time and memory usage, enabling scalability for large datasets.
 - Integrates seamlessly into machine learning (ML) workflows, making it suitable for genomic feature extraction, clustering, classification tasks, and bioinformatics applications in high-performance computing (HPC) environments.
+
+## Citation
+
+If you use **KMX** in your research, please cite the paper below (replace the placeholder with the full reference once finalized):
+
+> **Serajian M.**, *et al.* **“KMX: GPU-Accelerated K-mer K-mer Matrix Constructor.”** *Journal Name*, **Volume** (Year): pages. DOI: xx.xxxx/xxxxxxxx
+
 
 ## Dependencies
 
