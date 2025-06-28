@@ -100,7 +100,7 @@ python KMX.py -l PATH/genomes.txt -t PATH/tmp -k KMER_SIZE -o OUTPUT_DIR \
 | `column.npy` | NumPy NPY | a 1-d array representing column pointers of the CSR Matrix. |
 | `data.npy` | NumPy NPY | a 1-d array representing data of the CSR Matrix. |
 | `kmers.csv` | CSV | Tab‑separated list mapping column index → canonical k‑mer string. |
-| `run.log` | plain text | Resource usage record of parameter settings, and warnings. |
+| `run.log` | plain text | Resource usage record, parameter settings, and warnings. |
 
 After generating `row.npy`, `column.npy`, and `data.npy`, you can reconstruct the CSR matrix on the GPU with cupyx.scipy.sparse.csr_matrix((data, column, row)) or on the CPU with scipy.sparse.csr_matrix((data, (row, column))).
 
