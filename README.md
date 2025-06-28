@@ -84,7 +84,7 @@ python KMX.py -l PATH/genomes.txt -t PATH/tmp -k KMER_SIZE -o OUTPUT_DIR \
 
 | Flag | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `-l`, `--genome-list` | *str* | **yes** | – | Path to a plain‑text file with one genome file (FASTA/FASTQ, optionally gzipped) per line. |
+| `-l`, `--genome-list` | *str* | **yes** | – | Path to a plain‑text file with one genome file (FASTA) per line. |
 | `-min` | *int* | no | `1` | Lower bound on k‑mer count across **all** genomes; k‑mers observed fewer than *min* times are discarded. |
 | `-max` | *int* | no | *unlimited* | Upper bound on k‑mer count; set to remove highly conserved k‑mers that offer no discriminatory information. Must satisfy *max ≥ min*. |
 | `-t`, `--tmp` | *path* | **yes** | – | Directory for temporary files; created if absent. Script aborts if free space < 10 GB. |
