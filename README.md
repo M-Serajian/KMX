@@ -12,7 +12,7 @@ KMX is a GPU-accelerated software designed for efficient k-mer extraction from l
 
 ## Citation
 
-If you use **KMX** in your research, please cite the paper below (replace the placeholder with the full reference once finalized):
+If you use **KMX** in your research, please cite the paper below:
 
 > **Serajian M.**, *et al.* **“KMX: GPU-Accelerated K-mer K-mer Matrix Constructor.”** *Journal Name*, **Volume** (Year): pages. DOI: xx.xxxx/xxxxxxxx
 
