@@ -71,19 +71,12 @@ cd ../../..
 
 
 ## Usage
-KMX.py can be located at the KMX directory (the root on the cloned directory).
+`KMX.py` can be located at the KMX directory (the root on the cloned directory).
 
 
 ```bash
-python main.py \
-    -l PATH/genomes.txt \
-    -t PATH/tmp       \
-    -k KMER_SIZE      \
-    -o OUTPUT_DIR     \
-    [ -min X ]        \
-    [ -max Y ]        \
-    [ -d ]            \
-    [ -c ]
+python KMX.py -l PATH/genomes.txt -t PATH/tmp -k KMER_SIZE -o OUTPUT_DIR \
+    [ -min X ] [ -max Y ] [ -d ] [ -c ]
 ```
 
 | Flag | Type | Required | Default | Description |
