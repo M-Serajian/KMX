@@ -43,7 +43,6 @@ ml rapidsai/24.08
 
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-    build-essential \
     g++-12 \
     cmake \
     git \
