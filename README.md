@@ -84,13 +84,13 @@ python KMX.py -l PATH/genomes.txt -t PATH/tmp -k KMER_SIZE -o OUTPUT_DIR \
 | Flag | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
 | `-l`, `--genome-list` | *str* | **yes** | – | Path to a plain‑text file with one genome file (FASTA) per line. |
-| `-min` | *int* | no | `1` | Lower bound on k‑mer count across **all** genomes; k‑mers observed fewer than *min* times are discarded. |
-| `-max` | *int* | no | *unlimited* | Upper bound on k‑mer count; set to remove highly conserved k‑mers that offer no discriminatory information. Must satisfy *max ≥ min*. |
+| `-o`, `--output` | *path* | **yes** | – | Destination directory for final CSR matrix (`row.npy`,`column.npy`,`data.npy`), k‑mer index (`kmers.csv`), and run log file. |
 | `-t`, `--tmp` | *path* | **yes** | – | Directory for temporary files; created if absent. Script aborts if free space < 10 GB. |
 | `-k`, `--kmer-size` | *int* | **yes** | – | Length of k‑mers to extract; valid range **8 – 136**. |
+| `-min` | *int* | no | `1` | Lower bound on k‑mer count across **all** genomes; k‑mers observed fewer than *min* times are discarded. |
+| `-max` | *int* | no | *unlimited* | Upper bound on k‑mer count; set to remove highly conserved k‑mers that offer no discriminatory information. Must satisfy *max ≥ min*. |
 | `-d`, `--disable-normalization` | flag | no | *normalisation enabled* | Treat reverse complements as distinct features. |
 | `-c`, `--cpu` | flag | no | *GPU mode* | Force CPU execution; useful on hosts without CUDA‑capable devices. |
-| `-o`, `--output` | *path* | **yes** | – | Destination directory for final CSR matrix (`row.npy`,`column.npy`,`data.npy`), k‑mer index (`kmers.csv`), and run log file. |
 
 ## Output Files
 
