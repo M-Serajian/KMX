@@ -131,12 +131,12 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "--min", dest="min", type=int, default=5,
+        "-min", dest="min", type=int, default=5,
         help="Minimum occurrence threshold for a k-mer to be retained (default: 5)."
     )
 
     parser.add_argument(
-        "--max", dest="max", type=int, default=None,
+        "-max", dest="max", type=int, default=None,
         help=("Maximum occurrence threshold for a k-mer to be retained. "
               "If omitted, defaults to N/2 where N is the number of FASTA paths listed in --genome-list "
               "(after ignoring blank lines and lines starting with '#').")
