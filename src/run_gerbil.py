@@ -5,7 +5,7 @@ import subprocess
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Path to the gerbil binary (src/ -> project root -> include/gerbil-DataFrame/build/gerbil)
-GERBIL_EXECUTABLE = os.path.join(CURRENT_DIR, '..', 'include', 'gerbil-DataFrame', 'build', 'gerbil_wrapper.sh')
+GERBIL_EXECUTABLE = os.path.join(CURRENT_DIR, '..', 'include', 'gerbil-DataFrame', 'build', 'gerbil')
 GERBIL_EXECUTABLE = os.path.abspath(GERBIL_EXECUTABLE)
 
 
