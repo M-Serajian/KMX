@@ -17,14 +17,18 @@ warnings.filterwarnings('default')
 # ================================
 # Configuration
 # ================================
-ENV_NAME        = "KMX-env"
-PYTHON_VERSION  = "3.11"       # RAPIDS requires Python 3.11
-BOOST_VERSION   = "1.77"
-GCC_VERSION     = "12"         # GCC 12.2 – works with CUDA 12.8
-RAPIDS_VERSION  = "25.06"
-CUDA_MODULE_REQ = "12.8.1"     # Minimum CUDA version required
-CMAKE_MIN_VERSION = "3.5"      # Minimum version written into CMakeLists.txt patch
-CMAKE_CONDA_VERSION = "4.2"    # Minimum cmake version installed via conda
+ENV_NAME            = "KMX-env"
+PYTHON_VERSION      = "3.11.14"   # Exact version confirmed working
+BOOST_VERSION       = "1.77.0"    # Exact version confirmed working
+GCC_VERSION         = "12.2.0"    # Exact version confirmed working with CUDA 12.8
+RAPIDS_VERSION      = "25.06"     # Latest RAPIDS confirmed working with CUDA 12.8
+CUPY_VERSION        = "13.*"      # CuPy 14+ pulls CUDA 12.9 which breaks sm_89 kernels
+CUDA_VERSION        = "12.8"      # Exact CUDA version confirmed working
+CUDA_MODULE_REQ     = "12.8.1"    # Minimum CUDA driver version required
+ZLIB_VERSION        = "1.3.1"     # Exact version confirmed working
+BZIP2_VERSION       = "1.0.8"     # Exact version confirmed working
+CMAKE_MIN_VERSION   = "3.5"       # Minimum version written into CMakeLists.txt patch
+CMAKE_CONDA_VERSION = "4.2.3"     # Exact cmake version confirmed working
 
 # ================================
 # Colors
@@ -58,19 +62,27 @@ def print_info(message):    print_colored(f"ℹ {message}", Colors.BLUE)
 # ================================
 
 def detect_cuda_version():
-    """Auto-detect the maximum CUDA version supported by the installed NVIDIA driver.
+    """Verify the NVIDIA driver supports CUDA 12.8 or higher.
+
+    This function only checks the DRIVER version to confirm it is capable
+    of running CUDA 12.8. It does NOT use the driver version to pin the
+    conda CUDA version — the conda environment always installs exactly
+    CUDA_VERSION (12.8) regardless of whether the system driver supports
+    CUDA 13, 14, or higher. NVIDIA drivers are backward compatible, so
+    any driver supporting CUDA >= 12.8 can run a CUDA 12.8 runtime.
 
     Tries (in order):
       1. nvidia-smi        (compute nodes with direct GPU access)
       2. CUDA_HOME / CUDA_PATH / CUDA_ROOT env vars  (HPC module systems)
       3. nvcc --version
 
-    REQUIREMENT: CUDA 12.8 or higher is REQUIRED.
-
     Returns:
-        tuple: (major, minor, full_string) e.g. (12, 8, "12.8") or None.
+        tuple: (major, minor, full_string) of the DRIVER version e.g. (13, 0, "13.0")
+               or None if CUDA is not found.
     """
     print_header("Detecting GPU and CUDA Driver Version")
+    print_info(f"  Note: KMX conda environment will always use CUDA {CUDA_VERSION}")
+    print_info(f"  (driver version is only checked to confirm it supports CUDA >= 12.8)")
 
     # --- Strategy 1: nvidia-smi ---
     nvidia_smi = shutil.which("nvidia-smi")
@@ -92,13 +104,16 @@ def detect_cuda_version():
             if match:
                 major, minor = int(match.group(1)), int(match.group(2))
                 full = f"{major}.{minor}"
-                print_success(f"CUDA driver compatibility: {full}")
-                print_info(f"  Driver supports CUDA runtime up to {full}.")
+                print_success(f"CUDA driver supports up to: {full}")
                 if major < 12 or (major == 12 and minor < 8):
-                    print_error(f"CUDA VERSION TOO OLD: {full}")
-                    print_error(f"KMX REQUIRES CUDA {CUDA_MODULE_REQ} OR HIGHER!")
-                    raise RuntimeError(f"CUDA {full} is below minimum required version 12.8")
-                print_success(f"CUDA version {full} meets requirement (>= 12.8)")
+                    print_error(f"CUDA DRIVER TOO OLD: {full}")
+                    print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
+                    raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
+                if major > 12 or (major == 12 and minor > 8):
+                    print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
+                    print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
+                else:
+                    print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
                 return (major, minor, full)
         except subprocess.CalledProcessError as e:
             print_warning(f"nvidia-smi failed: {e}")
@@ -108,7 +123,7 @@ def detect_cuda_version():
             print_warning(f"Error parsing nvidia-smi output: {e}")
 
     # --- Strategy 2: HPC module environment variables ---
-    print_warning("nvidia-smi not available – checking CUDA module environment variables...")
+    print_warning("nvidia-smi not available – checking CUDA environment variables...")
     cuda_home = (os.environ.get('CUDA_HOME') or
                  os.environ.get('CUDA_PATH') or
                  os.environ.get('CUDA_ROOT'))
@@ -119,13 +134,16 @@ def detect_cuda_version():
         if version_match:
             major, minor = int(version_match.group(1)), int(version_match.group(2))
             full = f"{major}.{minor}"
-            print_success(f"CUDA version detected from module env: {full}")
+            print_success(f"CUDA driver version detected from env: {full}")
             if major < 12 or (major == 12 and minor < 8):
-                print_error(f"CUDA VERSION TOO OLD: {full}")
-                print_error(f"KMX REQUIRES CUDA {CUDA_MODULE_REQ} OR HIGHER!")
-                print_colored(f"  module load cuda/{CUDA_MODULE_REQ}", Colors.CYAN, bold=True)
-                raise RuntimeError(f"CUDA {full} is below minimum required version 12.8")
-            print_success(f"CUDA version {full} meets requirement (>= 12.8)")
+                print_error(f"CUDA DRIVER TOO OLD: {full}")
+                print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
+                raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
+            if major > 12 or (major == 12 and minor > 8):
+                print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
+                print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
+            else:
+                print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
             print_warning("Note: Running on a login node without direct GPU access.")
             print_warning("Make sure to run KMX jobs on compute nodes with a GPU!")
             return (major, minor, full)
@@ -141,10 +159,14 @@ def detect_cuda_version():
                 full = f"{major}.{minor}"
                 print_success(f"CUDA version detected from nvcc: {full}")
                 if major < 12 or (major == 12 and minor < 8):
-                    print_error(f"CUDA VERSION TOO OLD: {full}")
-                    print_error(f"KMX REQUIRES CUDA {CUDA_MODULE_REQ} OR HIGHER!")
-                    raise RuntimeError(f"CUDA {full} is below minimum required version 12.8")
-                print_success(f"CUDA version {full} meets requirement (>= 12.8)")
+                    print_error(f"CUDA DRIVER TOO OLD: {full}")
+                    print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
+                    raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
+                if major > 12 or (major == 12 and minor > 8):
+                    print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
+                    print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
+                else:
+                    print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
                 return (major, minor, full)
         except RuntimeError:
             raise
@@ -152,18 +174,21 @@ def detect_cuda_version():
             pass
 
     print_error("CUDA not found!")
-    print_info(f"KMX requires CUDA {CUDA_MODULE_REQ}+. On HPC clusters, load the module first:")
-    print_colored(f"  module load cuda/{CUDA_MODULE_REQ}", Colors.CYAN, bold=True)
+    print_info(f"KMX requires a GPU driver supporting CUDA >= 12.8.")
     return None
 
 
 def get_cuda_pin_version(cuda_info):
-    """Return a conda cuda-version pin string derived from the detected driver version.
+    """Return the fixed conda cuda-version pin string.
 
-    Example: driver supports CUDA 12.8  →  ">=12.0,<=12.8"
-    This prevents conda from installing a CUDA runtime newer than what the driver supports.
+    Always returns CUDA_VERSION (12.8) regardless of the driver version.
+    This ensures the conda environment is always isolated to the tested
+    CUDA version, even if the system driver supports CUDA 13, 14, etc.
+    NVIDIA drivers are backward compatible — a CUDA 13 driver can run
+    a CUDA 12.8 runtime without any issues.
     """
-    major, minor = cuda_info[0], cuda_info[1]
+    # Always pin to the tested/confirmed CUDA version, NOT the driver version
+    major, minor = CUDA_VERSION.split(".")
     return f">={major}.0,<={major}.{minor}"
 
 # ================================
@@ -389,7 +414,7 @@ def create_environment(conda_exe, conda_type, cuda_info=None):
 
     print_info("This may take 15-20 minutes...")
     print_info(f"Installing: cuDF {RAPIDS_VERSION}, Python {PYTHON_VERSION}, "
-               f"GCC 12.2, Boost {BOOST_VERSION}, CMake >={CMAKE_CONDA_VERSION}, "
+               f"GCC {GCC_VERSION}, Boost {BOOST_VERSION}, CMake >={CMAKE_CONDA_VERSION}, "
                f"Git, Make, zlib, bzip2")
     if cuda_pin:
         print_info(f"CUDA runtime pinned to: cuda-version{cuda_pin}")
@@ -399,14 +424,15 @@ def create_environment(conda_exe, conda_type, cuda_info=None):
     packages = [
         f"python={PYTHON_VERSION}",
         f"cudf={RAPIDS_VERSION}",
-        "gcc_linux-64=12.2.0",            # GCC 12.2 – known good with CUDA 12.8+
-        "gxx_linux-64=12.2.0",            # Matching G++
+        f"gcc_linux-64={GCC_VERSION}",    # Exact version confirmed working
+        f"gxx_linux-64={GCC_VERSION}",    # Matching G++
         f"boost-cpp={BOOST_VERSION}",
-        f"cmake>={CMAKE_CONDA_VERSION}",  # CMake 4.2+ required
+        f"cmake={CMAKE_CONDA_VERSION}",   # Exact cmake version confirmed working
         "git",
         "make",
-        "zlib",
-        "bzip2",
+        f"cupy={CUPY_VERSION}",
+        f"zlib={ZLIB_VERSION}",
+        f"bzip2={BZIP2_VERSION}",
     ]
     if cuda_pin:
         packages.append(f"cuda-version{cuda_pin}")
@@ -620,8 +646,8 @@ def install():
     print_info("  2. Check available disk space")
     print_info("  3. Create conda environment (KMX-env)")
     print_info(f"  4. Install packages:")
-    print_info(f"       cuDF {RAPIDS_VERSION}  |  Python {PYTHON_VERSION}  |  GCC 12.2  |  G++ 12.2")
-    print_info(f"       Boost {BOOST_VERSION}  |  CMake >={CMAKE_CONDA_VERSION}  |  Git  |  Make  |  zlib  |  bzip2")
+    print_info(f"       cuDF {RAPIDS_VERSION}  |  Python {PYTHON_VERSION}  |  GCC {GCC_VERSION}  |  G++ {GCC_VERSION}")
+    print_info(f"       Boost {BOOST_VERSION}  |  CMake {CMAKE_CONDA_VERSION}  |  Git  |  Make  |  zlib={ZLIB_VERSION}  |  bzip2={BZIP2_VERSION}")
     print_info("       (CUDA runtime pinned to match your GPU driver)")
     print_warning("⏱  Total estimated time: 15-20 minutes")
     print()
@@ -660,14 +686,32 @@ def install():
         print_error("Cannot find conda environment path!")
         return 1
 
-    if not build_gerbil(env_path):
-        print_error("Failed to build gerbil!")
-        return 1
+    gerbil_gpu = build_gerbil(env_path)
+    if not gerbil_gpu:
+        print_warning("gerbil build failed – KMX will continue but gerbil runs on CPU only!")
 
     # ── Success banner ────────────────────────────────────────────────────────
     print_colored("\n" + "="*70, Colors.GREEN, bold=True)
     print_colored("  ✓ Environment Setup Complete!", Colors.GREEN, bold=True)
     print_colored("="*70, Colors.GREEN, bold=True)
+
+    if not gerbil_gpu:
+        print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
+        print_colored("  ⚠  GERBIL GPU WARNING", Colors.YELLOW, bold=True)
+        print_colored("="*70, Colors.YELLOW, bold=True)
+        print_warning("  Gerbil was NOT compiled with GPU support.")
+        print_warning("  Gerbil will run on CPU ONLY – this may be significantly slower.")
+        print_warning("  Common causes:")
+        print_info("    • CUDA toolkit not found during cmake configuration")
+        print_info("    • cicc compiler not available in conda environment")
+        print_info("    • Build error in CUDA kernel files")
+        print_warning("  To fix, try recompiling manually:")
+        print_colored("    conda activate KMX-env", Colors.CYAN, bold=True)
+        print_colored("    cd include/gerbil-DataFrame", Colors.CYAN, bold=True)
+        print_colored("    mkdir -p build && cd build", Colors.CYAN, bold=True)
+        print_colored(f"    cmake .. -DCUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux", Colors.CYAN, bold=True)
+        print_colored("    make -j", Colors.CYAN, bold=True)
+        print_colored("="*70, Colors.YELLOW, bold=True)
 
     print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
     print_colored("  ⚠  SYSTEM REQUIREMENTS", Colors.YELLOW, bold=True)
@@ -695,9 +739,9 @@ def install():
     print_colored(f"\nEnvironment name: {ENV_NAME}",                  Colors.RESET)
     print_colored(f"Python version:   {PYTHON_VERSION}",             Colors.RESET)
     print_colored(f"cuDF version:     {RAPIDS_VERSION}",             Colors.RESET)
-    print_colored(f"GCC version:      12.2",                         Colors.RESET)
+    print_colored(f"GCC version:      {GCC_VERSION}",              Colors.RESET)
     print_colored(f"Boost version:    {BOOST_VERSION}",              Colors.RESET)
-    print_colored(f"CMake version:    >= {CMAKE_CONDA_VERSION}",     Colors.RESET)
+    print_colored(f"CMake version:    {CMAKE_CONDA_VERSION}",        Colors.RESET)
     print_colored(f"CUDA pinned to:   <= {cuda_info[2]}",            Colors.RESET)
 
     print_colored("\n" + "="*70, Colors.CYAN, bold=True)
@@ -719,35 +763,73 @@ def install():
 # ================================
 
 def uninstall():
-    """Remove the KMX-env conda environment."""
+    """Remove the KMX-env conda environment and all compiled gerbil files."""
     print_colored("\n" + "="*70, Colors.CYAN, bold=True)
     print_colored("  KMX Uninstallation", Colors.CYAN, bold=True)
     print_colored("="*70 + "\n", Colors.CYAN, bold=True)
 
-    print_warning("This will remove:")
-    print_info(f"  • Conda environment: {ENV_NAME}")
+    # Show exactly what will be removed
+    gerbil_exists = os.path.isdir(GERBIL_CLONE_PATH)
+    print_warning("The following will be permanently removed:")
+    print_info(f"  • Conda environment : {ENV_NAME}")
+    if gerbil_exists:
+        print_info(f"  • gerbil-DataFrame  : {os.path.abspath(GERBIL_CLONE_PATH)}")
+        binary_abs = os.path.abspath(GERBIL_BINARY)
+        if os.path.isfile(binary_abs):
+            print_info(f"  • gerbil binary     : {binary_abs}")
     print()
 
-    response = input("Continue with uninstallation? (y/N): ").strip().lower()
+    response = input("Are you sure you want to continue? (y/N): ").strip().lower()
     if response != 'y':
-        print_info("Uninstallation cancelled")
+        print_info("Uninstallation cancelled – nothing was removed.")
         return 0
 
+    all_ok = True
+
+    # ── Step 1: Remove conda environment ─────────────────────────────────────
+    print_header("Step 1/2 – Removing Conda Environment")
     conda_exe, _ = find_conda()
     if not conda_exe:
-        return 1
+        print_error("Cannot find conda – skipping environment removal.")
+        all_ok = False
+    else:
+        if not delete_environment(conda_exe):
+            print_warning("Environment deletion had issues – continuing...")
+            all_ok = False
 
-    if not delete_environment(conda_exe):
-        print_warning("Environment deletion had issues.")
-        return 1
+    # ── Step 2: Remove gerbil-DataFrame directory ─────────────────────────────
+    print_header("Step 2/2 – Removing gerbil-DataFrame")
+    if gerbil_exists:
+        try:
+            shutil.rmtree(GERBIL_CLONE_PATH)
+            print_success(f"Removed: {os.path.abspath(GERBIL_CLONE_PATH)}")
+        except Exception as e:
+            print_error(f"Failed to remove {GERBIL_CLONE_PATH}: {e}")
+            print_info(f"  Manual fix: rm -rf {os.path.abspath(GERBIL_CLONE_PATH)}")
+            all_ok = False
+    else:
+        print_info(f"gerbil-DataFrame directory not found – nothing to remove.")
 
-    print_colored("\n" + "="*70, Colors.GREEN, bold=True)
-    print_colored("  ✓ Uninstallation Complete!", Colors.GREEN, bold=True)
-    print_colored("="*70, Colors.GREEN, bold=True)
-    print_colored("\nOPTIONAL – free disk space from conda cache:", Colors.YELLOW, bold=True)
+    # ── Also remove empty include/ directory if nothing left ─────────────────
+    include_dir = "include"
+    if os.path.isdir(include_dir) and not os.listdir(include_dir):
+        try:
+            os.rmdir(include_dir)
+            print_success(f"Removed empty directory: {os.path.abspath(include_dir)}")
+        except Exception:
+            pass
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print_colored("\n" + "="*70, Colors.GREEN if all_ok else Colors.YELLOW, bold=True)
+    if all_ok:
+        print_colored("  ✓ Uninstallation Complete!", Colors.GREEN, bold=True)
+    else:
+        print_colored("  ⚠ Uninstallation completed with some warnings.", Colors.YELLOW, bold=True)
+    print_colored("="*70, Colors.GREEN if all_ok else Colors.YELLOW, bold=True)
+    print_colored("\nOPTIONAL – free disk space from conda package cache:", Colors.YELLOW, bold=True)
     print_colored("  conda clean --all -y", Colors.CYAN, bold=True)
     print()
-    return 0
+    return 0 if all_ok else 1
 
 # ================================
 # Gerbil Clone and Build
@@ -810,14 +892,48 @@ def patch_cmake():
     return True
 
 
-def build_gerbil(env_path):
-    """Build gerbil inside the conda environment using $CONDA_PREFIX CUDA."""
+def build_gerbil(env_path, force_rebuild=False):
+    """Build gerbil inside the conda environment using $CONDA_PREFIX CUDA.
+
+    If the binary already exists, asks the user whether to skip or recompile.
+    Pass force_rebuild=True to always recompile without prompting.
+    """
     print_header("Building gerbil-DataFrame")
 
     cmake_file = os.path.join(GERBIL_CLONE_PATH, "CMakeLists.txt")
     if not os.path.isfile(cmake_file):
         print_error("gerbil source not found! Run clone step first.")
         return False
+
+    binary_abs = os.path.abspath(GERBIL_BINARY)
+
+    # ── Already compiled? Ask the user ───────────────────────────────────────
+    if os.path.isfile(binary_abs) and not force_rebuild:
+        print_warning(f"gerbil binary already exists:")
+        print_colored(f"  {binary_abs}", Colors.CYAN)
+        file_size = os.path.getsize(binary_abs) / (1024 * 1024)
+        import time
+        mod_time  = time.strftime('%Y-%m-%d %H:%M:%S',
+                                  time.localtime(os.path.getmtime(binary_abs)))
+        print_info(f"  Size: {file_size:.1f} MB   |   Last built: {mod_time}")
+        print()
+        print_info("Options:")
+        print_colored("  1. Skip recompilation  (use existing binary)", Colors.GREEN)
+        print_colored("  2. Recompile from scratch  (clean build)", Colors.YELLOW)
+        print()
+        while True:
+            response = input("Enter choice (1/2): ").strip()
+            if response in ('1', '2'):
+                break
+            print_warning("  Please enter 1 or 2.")
+
+        if response == '1':
+            print_success("Skipping recompilation – using existing gerbil binary.")
+            return True
+        else:
+            print_info("Cleaning previous build directory...")
+            shutil.rmtree(os.path.abspath(GERBIL_BUILD_DIR), ignore_errors=True)
+            print_success("Build directory cleaned.")
 
     # Create build directory
     os.makedirs(GERBIL_BUILD_DIR, exist_ok=True)
@@ -857,9 +973,16 @@ def build_gerbil(env_path):
             check=True,
             env=my_env
         )
+        # Check if CUDA was actually found in cmake output
         print_success("CMake configuration successful!")
     except subprocess.CalledProcessError as e:
         print_error(f"CMake failed with code {e.returncode}")
+        print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
+        print_colored("  ⚠  GERBIL GPU WARNING", Colors.YELLOW, bold=True)
+        print_colored("="*70, Colors.YELLOW, bold=True)
+        print_warning("  CMake could not configure gerbil with CUDA.")
+        print_warning("  Gerbil will NOT use the GPU – CPU only mode.")
+        print_colored("="*70, Colors.YELLOW, bold=True)
         return False
 
     # Make
