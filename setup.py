@@ -23,8 +23,8 @@ BOOST_VERSION       = "1.77.0"    # Exact version confirmed working
 GCC_VERSION         = "12.2.0"    # Exact version confirmed working with CUDA 12.8
 RAPIDS_VERSION      = "25.06"     # Latest RAPIDS confirmed working with CUDA 12.8
 CUPY_VERSION        = "13.*"      # CuPy 14+ pulls CUDA 12.9 which breaks sm_89 kernels
-CUDA_VERSION        = "12.8"      # Exact CUDA version confirmed working
-CUDA_MODULE_REQ     = "12.8.1"    # Minimum CUDA driver version required
+CUDA_VERSION        = "12.8"      # Exact CUDA runtime version installed into conda env
+CUDA_MIN_DRIVER     = (525, 60)   # Minimum NVIDIA driver version supporting CUDA 12.8
 ZLIB_VERSION        = "1.3.1"     # Exact version confirmed working
 BZIP2_VERSION       = "1.0.8"     # Exact version confirmed working
 CMAKE_MIN_VERSION   = "3.5"       # Minimum version written into CMakeLists.txt patch
@@ -58,136 +58,124 @@ def print_warning(message): print_colored(f"⚠ {message}", Colors.YELLOW)
 def print_info(message):    print_colored(f"ℹ {message}", Colors.BLUE)
 
 # ================================
-# GPU / CUDA Driver Detection
+# NVIDIA Driver Detection
 # ================================
 
-def detect_cuda_version():
-    """Verify the NVIDIA driver supports CUDA 12.8 or higher.
+def detect_nvidia_driver():
+    """Verify the NVIDIA driver is installed and supports CUDA 12.8 or higher.
 
-    This function only checks the DRIVER version to confirm it is capable
-    of running CUDA 12.8. It does NOT use the driver version to pin the
-    conda CUDA version — the conda environment always installs exactly
-    CUDA_VERSION (12.8) regardless of whether the system driver supports
-    CUDA 13, 14, or higher. NVIDIA drivers are backward compatible, so
-    any driver supporting CUDA >= 12.8 can run a CUDA 12.8 runtime.
+    This function checks ONLY the host NVIDIA driver version via nvidia-smi.
+    The CUDA runtime (12.8) is installed automatically into the conda environment
+    and does NOT need to be present on the host system.
 
-    Tries (in order):
-      1. nvidia-smi        (compute nodes with direct GPU access)
-      2. CUDA_HOME / CUDA_PATH / CUDA_ROOT env vars  (HPC module systems)
-      3. nvcc --version
+    What this checks:
+      - NVIDIA driver is installed and accessible
+      - Driver version is >= 525.60 (minimum required to run CUDA 12.8 runtime)
+
+    What this does NOT check (and does not need to):
+      - System-level CUDA toolkit installation
+      - CUDA_HOME / CUDA_PATH environment variables
+      - nvcc availability
+
+    NVIDIA drivers are backward compatible:
+      - Driver 525.60 supports CUDA runtime <= 12.8
+      - Driver 550.xx supports CUDA runtime <= 12.4  (still fine for 12.8 in env)
+      - Any driver >= 525.60 can run the CUDA 12.8 conda runtime
 
     Returns:
-        tuple: (major, minor, full_string) of the DRIVER version e.g. (13, 0, "13.0")
-               or None if CUDA is not found.
+        tuple: (major, minor, full_string) of the driver version e.g. (525, 60, "525.60")
+               or None if the NVIDIA driver is not found or too old.
     """
-    print_header("Detecting GPU and CUDA Driver Version")
-    print_info(f"  Note: KMX conda environment will always use CUDA {CUDA_VERSION}")
-    print_info(f"  (driver version is only checked to confirm it supports CUDA >= 12.8)")
+    print_header("Detecting NVIDIA Driver")
+    print_colored("\n  What is being checked:", Colors.CYAN)
+    print_info("  • NVIDIA Driver  (host OS level) – must be >= 525.60")
+    print_info(f"  • CUDA Runtime   (conda level)  – will be installed automatically as {CUDA_VERSION}")
+    print_colored("  The driver must exist on the host; the runtime is handled by conda.\n", Colors.YELLOW)
 
-    # --- Strategy 1: nvidia-smi ---
     nvidia_smi = shutil.which("nvidia-smi")
-    if nvidia_smi:
-        try:
-            result = subprocess.run(
-                [nvidia_smi, "--query-gpu=driver_version,name", "--format=csv,noheader"],
-                capture_output=True, text=True, check=True
+    if not nvidia_smi:
+        print_error("nvidia-smi not found!")
+        print_error("The NVIDIA GPU driver does not appear to be installed.")
+        print_colored("\n  To fix:", Colors.YELLOW, bold=True)
+        print_info("  • On a workstation/server: install the NVIDIA driver from")
+        print_info("    https://www.nvidia.com/Download/index.aspx")
+        print_info(f"  • Minimum required driver version: {CUDA_MIN_DRIVER[0]}.{CUDA_MIN_DRIVER[1]}")
+        print_info("  • On an HPC cluster: contact your sysadmin or check available GPU nodes")
+        return None
+
+    # Query GPU name
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=driver_version,name", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True
+        )
+        gpu_info = result.stdout.strip()
+        if gpu_info:
+            print_success(f"GPU detected: {gpu_info}")
+    except Exception:
+        pass
+
+    # Parse driver version from nvidia-smi header
+    try:
+        result = subprocess.run([nvidia_smi], capture_output=True, text=True, check=True)
+
+        # Parse driver version (e.g. "Driver Version: 525.105.17")
+        driver_match = re.search(r'Driver Version:\s+(\d+)\.(\d+)', result.stdout)
+        if not driver_match:
+            print_error("Could not parse NVIDIA driver version from nvidia-smi output.")
+            print_warning("Please verify your NVIDIA driver installation.")
+            return None
+
+        drv_major = int(driver_match.group(1))
+        drv_minor = int(driver_match.group(2))
+        drv_full  = f"{drv_major}.{drv_minor}"
+        print_success(f"NVIDIA Driver version: {drv_full}")
+
+        # Also show what CUDA version this driver supports (informational only)
+        cuda_match = re.search(r'CUDA Version:\s+(\d+\.\d+)', result.stdout)
+        if cuda_match:
+            print_info(f"  This driver supports CUDA runtime up to: {cuda_match.group(1)}")
+        print_info(f"  conda environment will use CUDA runtime: {CUDA_VERSION}")
+
+        # Check minimum driver version
+        min_major, min_minor = CUDA_MIN_DRIVER
+        if (drv_major, drv_minor) < (min_major, min_minor):
+            print_error(f"NVIDIA DRIVER TOO OLD: {drv_full}")
+            print_error(f"KMX requires driver >= {min_major}.{min_minor} to run CUDA {CUDA_VERSION} runtime.")
+            print_colored("\n  To fix:", Colors.YELLOW, bold=True)
+            print_info(f"  • Update your NVIDIA driver to >= {min_major}.{min_minor}")
+            print_info("  • https://www.nvidia.com/Download/index.aspx")
+            raise RuntimeError(
+                f"NVIDIA driver {drv_full} is below minimum required {min_major}.{min_minor}"
             )
-            gpu_info = result.stdout.strip()
-            if gpu_info:
-                print_success(f"GPU detected: {gpu_info}")
-        except Exception:
-            pass
 
-        try:
-            result = subprocess.run([nvidia_smi], capture_output=True, text=True, check=True)
-            match = re.search(r'CUDA Version:\s+(\d+)\.(\d+)', result.stdout)
-            if match:
-                major, minor = int(match.group(1)), int(match.group(2))
-                full = f"{major}.{minor}"
-                print_success(f"CUDA driver supports up to: {full}")
-                if major < 12 or (major == 12 and minor < 8):
-                    print_error(f"CUDA DRIVER TOO OLD: {full}")
-                    print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
-                    raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
-                if major > 12 or (major == 12 and minor > 8):
-                    print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
-                    print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
-                else:
-                    print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
-                return (major, minor, full)
-        except subprocess.CalledProcessError as e:
-            print_warning(f"nvidia-smi failed: {e}")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            print_warning(f"Error parsing nvidia-smi output: {e}")
+        print_success(
+            f"Driver {drv_full} >= {min_major}.{min_minor} – "
+            f"compatible with CUDA {CUDA_VERSION} runtime ✓"
+        )
+        return (drv_major, drv_minor, drv_full)
 
-    # --- Strategy 2: HPC module environment variables ---
-    print_warning("nvidia-smi not available – checking CUDA environment variables...")
-    cuda_home = (os.environ.get('CUDA_HOME') or
-                 os.environ.get('CUDA_PATH') or
-                 os.environ.get('CUDA_ROOT'))
-
-    if cuda_home:
-        print_info(f"CUDA installation path: {cuda_home}")
-        version_match = re.search(r'(\d+)\.(\d+)(?:\.(\d+))?', cuda_home)
-        if version_match:
-            major, minor = int(version_match.group(1)), int(version_match.group(2))
-            full = f"{major}.{minor}"
-            print_success(f"CUDA driver version detected from env: {full}")
-            if major < 12 or (major == 12 and minor < 8):
-                print_error(f"CUDA DRIVER TOO OLD: {full}")
-                print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
-                raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
-            if major > 12 or (major == 12 and minor > 8):
-                print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
-                print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
-            else:
-                print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
-            print_warning("Note: Running on a login node without direct GPU access.")
-            print_warning("Make sure to run KMX jobs on compute nodes with a GPU!")
-            return (major, minor, full)
-
-    # --- Strategy 3: nvcc ---
-    nvcc = shutil.which("nvcc")
-    if nvcc:
-        try:
-            result = subprocess.run([nvcc, "--version"], capture_output=True, text=True, check=True)
-            match = re.search(r'release (\d+)\.(\d+)', result.stdout)
-            if match:
-                major, minor = int(match.group(1)), int(match.group(2))
-                full = f"{major}.{minor}"
-                print_success(f"CUDA version detected from nvcc: {full}")
-                if major < 12 or (major == 12 and minor < 8):
-                    print_error(f"CUDA DRIVER TOO OLD: {full}")
-                    print_error(f"KMX requires a driver supporting CUDA >= 12.8!")
-                    raise RuntimeError(f"Driver CUDA {full} is below minimum required 12.8")
-                if major > 12 or (major == 12 and minor > 8):
-                    print_success(f"Driver supports CUDA {full} — backward compatible with CUDA {CUDA_VERSION} ✓")
-                    print_info(f"  conda environment will use CUDA {CUDA_VERSION} (not {full})")
-                else:
-                    print_success(f"Driver CUDA {full} matches target version {CUDA_VERSION} ✓")
-                return (major, minor, full)
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-    print_error("CUDA not found!")
-    print_info(f"KMX requires a GPU driver supporting CUDA >= 12.8.")
-    return None
+    except subprocess.CalledProcessError as e:
+        print_error(f"nvidia-smi failed: {e}")
+        print_warning("Cannot determine driver version. Do you have GPU access on this node?")
+        return None
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print_warning(f"Error parsing nvidia-smi output: {e}")
+        return None
 
 
-def get_cuda_pin_version(cuda_info):
+def get_cuda_pin_version(driver_info):
     """Return the fixed conda cuda-version pin string.
 
     Always returns CUDA_VERSION (12.8) regardless of the driver version.
     This ensures the conda environment is always isolated to the tested
-    CUDA version, even if the system driver supports CUDA 13, 14, etc.
-    NVIDIA drivers are backward compatible — a CUDA 13 driver can run
-    a CUDA 12.8 runtime without any issues.
+    CUDA version, even if the system driver supports a higher CUDA version.
+    NVIDIA drivers are backward compatible — a newer driver can run
+    an older CUDA runtime without any issues.
     """
-    # Always pin to the tested/confirmed CUDA version, NOT the driver version
+    # Always pin to the tested/confirmed CUDA version, NOT derived from the driver
     major, minor = CUDA_VERSION.split(".")
     return f">={major}.0,<={major}.{minor}"
 
@@ -198,12 +186,12 @@ def get_cuda_pin_version(cuda_info):
 def estimate_disk_space():
     """Estimate and verify available disk space."""
     print_info("Estimated disk space needed:")
-    print_info("  - cuDF + CUDA (RAPIDS, auto-resolved): ~5 GB")
-    print_info("  - Python + dependencies:               ~500 MB")
-    print_info(f"  - Boost {BOOST_VERSION}:                         ~200 MB")
-    print_info(f"  - Build tools (CMake, Git, GCC {GCC_VERSION}):  ~500 MB")
-    print_info("  - Development libraries (zlib, bzip2): ~50 MB")
-    print_info("  - Package cache (temporary):           ~2 GB")
+    print_info("  - cuDF + CUDA runtime (RAPIDS, auto-resolved): ~5 GB")
+    print_info("  - Python + dependencies:                       ~500 MB")
+    print_info(f"  - Boost {BOOST_VERSION}:                              ~200 MB")
+    print_info(f"  - Build tools (CMake, Git, GCC {GCC_VERSION}):       ~500 MB")
+    print_info("  - Development libraries (zlib, bzip2):         ~50 MB")
+    print_info("  - Package cache (temporary):                   ~2 GB")
     print_colored("\n  Total: ~8-9 GB\n", Colors.YELLOW, bold=True)
 
     check_path = os.path.expanduser("~")
@@ -386,7 +374,7 @@ def get_env_path(conda_exe, env_name):
     return None
 
 
-def create_environment(conda_exe, conda_type, cuda_info=None):
+def create_environment(conda_exe, conda_type, driver_info=None):
     """Create the KMX-env conda environment with all required packages."""
     print_header(f"Creating Conda Environment: {ENV_NAME}")
 
@@ -402,22 +390,23 @@ def create_environment(conda_exe, conda_type, cuda_info=None):
             print_info("Using existing environment")
             return True
 
-    # Build CUDA version pin from the detected driver
+    # Build CUDA version pin
     cuda_pin = None
-    if cuda_info:
-        cuda_pin = get_cuda_pin_version(cuda_info)
-        print_info(f"Pinning CUDA runtime to your driver: cuda-version{cuda_pin}")
-        print_info(f"  (Driver supports up to CUDA {cuda_info[2]})")
+    if driver_info:
+        cuda_pin = get_cuda_pin_version(driver_info)
+        print_info(f"Pinning CUDA runtime to: cuda-version{cuda_pin}")
+        print_info(f"  (Driver {driver_info[2]} confirmed compatible)")
     else:
-        print_warning("No GPU detected – installing without CUDA version pin.")
+        print_warning("No GPU driver detected – installing without CUDA version pin.")
         print_warning("cuDF may install a CUDA runtime incompatible with your system!")
 
     print_info("This may take 15-20 minutes...")
     print_info(f"Installing: cuDF {RAPIDS_VERSION}, Python {PYTHON_VERSION}, "
                f"GCC {GCC_VERSION}, Boost {BOOST_VERSION}, CMake >={CMAKE_CONDA_VERSION}, "
                f"Git, Make, zlib, bzip2")
+    print_info(f"  CUDA runtime {CUDA_VERSION} will be pulled in automatically as a dependency")
     if cuda_pin:
-        print_info(f"CUDA runtime pinned to: cuda-version{cuda_pin}")
+        print_info(f"  CUDA runtime pinned to: cuda-version{cuda_pin}")
     print_warning("All warnings and messages will be shown (not suppressed)")
 
     # ── Package list ──────────────────────────────────────────────────────────
@@ -641,35 +630,43 @@ def install():
     print_colored("  Conda Environment Installer for Genomic K-mer Analysis", Colors.CYAN, bold=True)
     print_colored("="*70 + "\n", Colors.CYAN, bold=True)
 
+    min_drv = f"{CUDA_MIN_DRIVER[0]}.{CUDA_MIN_DRIVER[1]}"
+    print_colored("  REQUIREMENTS", Colors.YELLOW, bold=True)
+    print_colored("  ─────────────────────────────────────────────────────", Colors.YELLOW)
+    print_colored(f"  • NVIDIA Driver  >= {min_drv}  "
+                  f"(host OS – must be installed before running this script)", Colors.YELLOW)
+    print_colored(f"  • CUDA Runtime      {CUDA_VERSION}      "
+                  f"(conda level – installed automatically by this script)", Colors.YELLOW)
+    print_colored("  ─────────────────────────────────────────────────────\n", Colors.YELLOW)
+
     print_warning("Installation steps:")
-    print_info(f"  1. Detect GPU and CUDA driver version (REQUIRES {CUDA_MODULE_REQ}+)")
+    print_info(f"  1. Detect NVIDIA driver (REQUIRES driver >= {min_drv})")
     print_info("  2. Check available disk space")
     print_info("  3. Create conda environment (KMX-env)")
     print_info(f"  4. Install packages:")
     print_info(f"       cuDF {RAPIDS_VERSION}  |  Python {PYTHON_VERSION}  |  GCC {GCC_VERSION}  |  G++ {GCC_VERSION}")
     print_info(f"       Boost {BOOST_VERSION}  |  CMake {CMAKE_CONDA_VERSION}  |  Git  |  Make  |  zlib={ZLIB_VERSION}  |  bzip2={BZIP2_VERSION}")
-    print_info("       (CUDA runtime pinned to match your GPU driver)")
+    print_info(f"       CUDA runtime {CUDA_VERSION} (pulled in automatically as a dependency)")
     print_warning("⏱  Total estimated time: 15-20 minutes")
-    print()
-    print_warning("REQUIREMENT: Load the CUDA module before running!")
-    print_colored(f"  module load cuda/{CUDA_MODULE_REQ}", Colors.CYAN, bold=True)
     print()
 
     if not estimate_disk_space():
         print_warning("Installation cancelled.")
         return 1
 
-    cuda_info = detect_cuda_version()
-    if not cuda_info:
-        print_error(f"CUDA {CUDA_MODULE_REQ}+ is REQUIRED for KMX!")
-        print_error("Installation cannot continue without CUDA 12.8 or higher.")
+    driver_info = detect_nvidia_driver()
+    if not driver_info:
+        print_error(f"NVIDIA driver >= {min_drv} is REQUIRED for KMX!")
+        print_error("Installation cannot continue without a compatible NVIDIA driver.")
+        print_colored(f"\n  Install or update the NVIDIA driver (>= {min_drv}):", Colors.YELLOW, bold=True)
+        print_info("  https://www.nvidia.com/Download/index.aspx")
         return 1
 
     conda_exe, conda_type = find_conda()
     if not conda_exe:
         return 1
 
-    if not create_environment(conda_exe, conda_type, cuda_info=cuda_info):
+    if not create_environment(conda_exe, conda_type, driver_info=driver_info):
         print_error("Environment creation failed!")
         return 1
 
@@ -736,13 +733,14 @@ def install():
     print_colored("\n" + "="*70, Colors.CYAN, bold=True)
     print_colored("  Installation Details", Colors.CYAN, bold=True)
     print_colored("="*70, Colors.CYAN, bold=True)
-    print_colored(f"\nEnvironment name: {ENV_NAME}",                  Colors.RESET)
-    print_colored(f"Python version:   {PYTHON_VERSION}",             Colors.RESET)
-    print_colored(f"cuDF version:     {RAPIDS_VERSION}",             Colors.RESET)
-    print_colored(f"GCC version:      {GCC_VERSION}",              Colors.RESET)
-    print_colored(f"Boost version:    {BOOST_VERSION}",              Colors.RESET)
-    print_colored(f"CMake version:    {CMAKE_CONDA_VERSION}",        Colors.RESET)
-    print_colored(f"CUDA pinned to:   <= {cuda_info[2]}",            Colors.RESET)
+    print_colored(f"\nEnvironment name:    {ENV_NAME}",            Colors.RESET)
+    print_colored(f"Python version:      {PYTHON_VERSION}",        Colors.RESET)
+    print_colored(f"cuDF version:        {RAPIDS_VERSION}",        Colors.RESET)
+    print_colored(f"CUDA runtime:        {CUDA_VERSION}  (installed inside conda env)", Colors.RESET)
+    print_colored(f"NVIDIA driver:       {driver_info[2]}  (host OS)", Colors.RESET)
+    print_colored(f"GCC version:         {GCC_VERSION}",           Colors.RESET)
+    print_colored(f"Boost version:       {BOOST_VERSION}",         Colors.RESET)
+    print_colored(f"CMake version:       {CMAKE_CONDA_VERSION}",   Colors.RESET)
 
     print_colored("\n" + "="*70, Colors.CYAN, bold=True)
     print_colored("  HOW TO USE KMX", Colors.CYAN, bold=True)
@@ -1056,3 +1054,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
