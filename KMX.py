@@ -8,6 +8,7 @@ import threading
 
 from src.args import parse_arguments
 from src.create_csr_matrix import create_csr_matrix
+from src.run_gerbil import gerbil_built_with_gpu
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,13 @@ def main() -> int:
 
     # Decide CPU/GPU mode early
     gpu_enabled = not args.cpu
+
+    # Surface gerbil's compile mode (set at install time by setup.py).
+    gerbil_gpu_build = gerbil_built_with_gpu()
+    log.info("gerbil compile mode: %s", "GPU (CUDA)" if gerbil_gpu_build else "CPU only")
+    if gpu_enabled and not gerbil_gpu_build:
+        log.info("gerbil will run on CPU (binary was built CPU-only). "
+                 "To enable GPU gerbil, reinstall with: python setup.py install --gerbil-gpu")
 
     cp = None
     monitor = None
@@ -125,6 +133,7 @@ def main() -> int:
         f"Max value: {args.max}\n"
         f"Normalization disabled: {args.disable_normalization}\n"
         f"GPU enabled: {gpu_enabled}\n"
+        f"gerbil compile mode: {'GPU (CUDA)' if gerbil_gpu_build else 'CPU only'}\n"
         f"Processing time: {elapsed}\n"
     )
     if gpu_enabled:

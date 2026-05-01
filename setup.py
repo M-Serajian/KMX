@@ -11,6 +11,7 @@ import subprocess
 import shutil
 import warnings
 import re
+import argparse
 
 warnings.filterwarnings('default')
 
@@ -43,9 +44,9 @@ class Colors:
     RESET   = "\033[0m"
     BOLD    = "\033[1m"
 
-def print_colored(message, color=Colors.RESET, bold=False):
+def print_colored(message, color=Colors.RESET, bold=False, end="\n"):
     prefix = Colors.BOLD if bold else ""
-    print(f"{prefix}{color}{message}{Colors.RESET}")
+    print(f"{prefix}{color}{message}{Colors.RESET}", end=end)
 
 def print_header(message):
     print_colored(f"\n{'='*70}", Colors.CYAN, bold=True)
@@ -603,6 +604,18 @@ def verify():
         print_error("Cannot check CMake – environment not found")
         all_ok = False
 
+    # gerbil binary + compile mode
+    print_info("\n[+] Checking gerbil binary...")
+    gerbil_bin = os.path.abspath(GERBIL_BINARY)
+    if os.path.isfile(gerbil_bin):
+        gerbil_is_gpu = os.path.isfile(os.path.abspath(GERBIL_GPU_MARKER))
+        mode = "GPU (CUDA)" if gerbil_is_gpu else "CPU only"
+        print_success(f"gerbil binary found: {gerbil_bin}  [{mode}]")
+    else:
+        print_error(f"gerbil binary NOT found at {gerbil_bin}")
+        print_info("  Fix: python setup.py install [--gerbil-gpu]")
+        all_ok = False
+
     # Summary
     print_header("Verification Summary")
     if all_ok:
@@ -623,12 +636,20 @@ def verify():
 # Install
 # ================================
 
-def install():
-    """Create the KMX-env conda environment with all required packages."""
+def install(gerbil_gpu=False):
+    """Create the KMX-env conda environment with all required packages.
+
+    Args:
+        gerbil_gpu: if True, compile gerbil with CUDA/GPU support. If False
+            (default), gerbil is compiled CPU-only.
+    """
     print_colored("\n" + "="*70, Colors.CYAN, bold=True)
     print_colored("  KMX Environment Setup", Colors.CYAN, bold=True)
     print_colored("  Conda Environment Installer for Genomic K-mer Analysis", Colors.CYAN, bold=True)
     print_colored("="*70 + "\n", Colors.CYAN, bold=True)
+    gerbil_mode_label = "GPU (CUDA)" if gerbil_gpu else "CPU only"
+    print_colored(f"  gerbil build mode: {gerbil_mode_label}", Colors.CYAN, bold=True)
+    print()
 
     min_drv = f"{CUDA_MIN_DRIVER[0]}.{CUDA_MIN_DRIVER[1]}"
     print_colored("  REQUIREMENTS", Colors.YELLOW, bold=True)
@@ -683,9 +704,10 @@ def install():
         print_error("Cannot find conda environment path!")
         return 1
 
-    gerbil_gpu = build_gerbil(env_path)
-    if not gerbil_gpu:
-        print_warning("gerbil build failed – KMX will continue but gerbil runs on CPU only!")
+    gerbil_built = build_gerbil(env_path, enable_gpu=gerbil_gpu)
+    if not gerbil_built:
+        print_error("gerbil build failed – KMX cannot run without the gerbil binary.")
+        return 1
 
     # ── Success banner ────────────────────────────────────────────────────────
     print_colored("\n" + "="*70, Colors.GREEN, bold=True)
@@ -694,20 +716,11 @@ def install():
 
     if not gerbil_gpu:
         print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
-        print_colored("  ⚠  GERBIL GPU WARNING", Colors.YELLOW, bold=True)
+        print_colored("  ℹ  GERBIL CPU MODE", Colors.YELLOW, bold=True)
         print_colored("="*70, Colors.YELLOW, bold=True)
-        print_warning("  Gerbil was NOT compiled with GPU support.")
-        print_warning("  Gerbil will run on CPU ONLY – this may be significantly slower.")
-        print_warning("  Common causes:")
-        print_info("    • CUDA toolkit not found during cmake configuration")
-        print_info("    • cicc compiler not available in conda environment")
-        print_info("    • Build error in CUDA kernel files")
-        print_warning("  To fix, try recompiling manually:")
-        print_colored("    conda activate KMX-env", Colors.CYAN, bold=True)
-        print_colored("    cd include/gerbil-DataFrame", Colors.CYAN, bold=True)
-        print_colored("    mkdir -p build && cd build", Colors.CYAN, bold=True)
-        print_colored(f"    cmake .. -DCUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux", Colors.CYAN, bold=True)
-        print_colored("    make -j", Colors.CYAN, bold=True)
+        print_info("  Gerbil was compiled CPU-only (default).")
+        print_info("  To rebuild gerbil with GPU/CUDA support, run:")
+        print_colored("    python setup.py install --gerbil-gpu", Colors.CYAN, bold=True)
         print_colored("="*70, Colors.YELLOW, bold=True)
 
     print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
@@ -837,6 +850,7 @@ GERBIL_REPO_URL    = "https://github.com/M-Serajian/gerbil-DataFrame.git"
 GERBIL_CLONE_PATH  = "include/gerbil-DataFrame"
 GERBIL_BUILD_DIR   = "include/gerbil-DataFrame/build"
 GERBIL_BINARY      = "include/gerbil-DataFrame/build/gerbil"
+GERBIL_GPU_MARKER  = "include/gerbil-DataFrame/build/.gerbil_gpu"
 
 
 def clone_gerbil():
@@ -890,13 +904,21 @@ def patch_cmake():
     return True
 
 
-def build_gerbil(env_path, force_rebuild=False):
-    """Build gerbil inside the conda environment using $CONDA_PREFIX CUDA.
+def build_gerbil(env_path, enable_gpu=False, force_rebuild=False):
+    """Build gerbil inside the conda environment.
 
-    If the binary already exists, asks the user whether to skip or recompile.
-    Pass force_rebuild=True to always recompile without prompting.
+    Args:
+        env_path: absolute path to the KMX-env conda environment.
+        enable_gpu: if True, build gerbil with CUDA/GPU support. If False (default),
+            build gerbil CPU-only by disabling CMake's CUDA detection.
+        force_rebuild: if True, always recompile from scratch without prompting.
+
+    If the binary already exists and its compiled mode matches the requested mode,
+    asks the user whether to skip or recompile. If the existing binary's mode does
+    NOT match the requested mode, an automatic clean rebuild is triggered.
     """
-    print_header("Building gerbil-DataFrame")
+    mode_label = "GPU (CUDA)" if enable_gpu else "CPU only"
+    print_header(f"Building gerbil-DataFrame [{mode_label}]")
 
     cmake_file = os.path.join(GERBIL_CLONE_PATH, "CMakeLists.txt")
     if not os.path.isfile(cmake_file):
@@ -904,9 +926,12 @@ def build_gerbil(env_path, force_rebuild=False):
         return False
 
     binary_abs = os.path.abspath(GERBIL_BINARY)
+    marker_abs = os.path.abspath(GERBIL_GPU_MARKER)
+    existing_is_gpu = os.path.isfile(marker_abs)
 
-    # ── Already compiled? Ask the user ───────────────────────────────────────
+    # ── Already compiled? ────────────────────────────────────────────────────
     if os.path.isfile(binary_abs) and not force_rebuild:
+        existing_label = "GPU (CUDA)" if existing_is_gpu else "CPU only"
         print_warning(f"gerbil binary already exists:")
         print_colored(f"  {binary_abs}", Colors.CYAN)
         file_size = os.path.getsize(binary_abs) / (1024 * 1024)
@@ -914,24 +939,32 @@ def build_gerbil(env_path, force_rebuild=False):
         mod_time  = time.strftime('%Y-%m-%d %H:%M:%S',
                                   time.localtime(os.path.getmtime(binary_abs)))
         print_info(f"  Size: {file_size:.1f} MB   |   Last built: {mod_time}")
+        print_info(f"  Existing build mode: {existing_label}")
+        print_info(f"  Requested build mode: {mode_label}")
         print()
-        print_info("Options:")
-        print_colored("  1. Skip recompilation  (use existing binary)", Colors.GREEN)
-        print_colored("  2. Recompile from scratch  (clean build)", Colors.YELLOW)
-        print()
-        while True:
-            response = input("Enter choice (1/2): ").strip()
-            if response in ('1', '2'):
-                break
-            print_warning("  Please enter 1 or 2.")
 
-        if response == '1':
-            print_success("Skipping recompilation – using existing gerbil binary.")
-            return True
-        else:
-            print_info("Cleaning previous build directory...")
+        if existing_is_gpu != enable_gpu:
+            print_warning("Existing binary mode does NOT match requested mode – forcing clean rebuild.")
             shutil.rmtree(os.path.abspath(GERBIL_BUILD_DIR), ignore_errors=True)
             print_success("Build directory cleaned.")
+        else:
+            print_info("Options:")
+            print_colored("  1. Skip recompilation  (use existing binary)", Colors.GREEN)
+            print_colored("  2. Recompile from scratch  (clean build)", Colors.YELLOW)
+            print()
+            while True:
+                response = input("Enter choice (1/2): ").strip()
+                if response in ('1', '2'):
+                    break
+                print_warning("  Please enter 1 or 2.")
+
+            if response == '1':
+                print_success("Skipping recompilation – using existing gerbil binary.")
+                return True
+            else:
+                print_info("Cleaning previous build directory...")
+                shutil.rmtree(os.path.abspath(GERBIL_BUILD_DIR), ignore_errors=True)
+                print_success("Build directory cleaned.")
 
     # Create build directory
     os.makedirs(GERBIL_BUILD_DIR, exist_ok=True)
@@ -939,48 +972,60 @@ def build_gerbil(env_path, force_rebuild=False):
     gerbil_source_abs = os.path.abspath(GERBIL_CLONE_PATH)
     build_dir_abs     = os.path.abspath(GERBIL_BUILD_DIR)
 
-    # Build env with conda paths and cicc on PATH
+    # Build env with conda paths
     my_env = os.environ.copy()
-    my_env['PATH']             = f"{env_path}/nvvm/bin:{env_path}/bin:{my_env.get('PATH', '')}"
+    if enable_gpu:
+        my_env['PATH'] = f"{env_path}/nvvm/bin:{env_path}/bin:{my_env.get('PATH', '')}"
+    else:
+        my_env['PATH'] = f"{env_path}/bin:{my_env.get('PATH', '')}"
     my_env['LD_LIBRARY_PATH']  = f"{env_path}/lib:{my_env.get('LD_LIBRARY_PATH', '')}"
     my_env['CC']               = os.path.join(env_path, "bin", "x86_64-conda-linux-gnu-gcc")
     my_env['CXX']              = os.path.join(env_path, "bin", "x86_64-conda-linux-gnu-g++")
-    cuda_root                  = os.path.join(env_path, "targets", "x86_64-linux")
 
     cmake_bin  = os.path.join(env_path, "bin", "cmake")
     cpu_count  = os.cpu_count() or 4
 
-    # CMake configure
-    print_info(f"Running cmake with CUDA root: {cuda_root}")
-    print_info(f"cicc path: {env_path}/nvvm/bin/cicc")
-    print_info(f"Forcing conda zlib/bzip2 (not system libraries)...")
+    # ── Common CMake args (shared by CPU and GPU builds) ─────────────────────
+    cmake_args = [
+        cmake_bin,
+        f"-DZLIB_ROOT={env_path}",
+        f"-DZLIB_LIBRARY={env_path}/lib/libz.so",
+        f"-DZLIB_INCLUDE_DIR={env_path}/include",
+        f"-DBZIP2_ROOT={env_path}",
+        f"-DBZIP2_LIBRARIES={env_path}/lib/libbz2.so",
+        f"-DBZIP2_INCLUDE_DIR={env_path}/include",
+    ]
+
+    if enable_gpu:
+        cuda_root = os.path.join(env_path, "targets", "x86_64-linux")
+        cmake_args.append(f"-DCUDA_TOOLKIT_ROOT_DIR={cuda_root}")
+        print_info(f"Running cmake WITH CUDA support – CUDA root: {cuda_root}")
+        print_info(f"cicc path: {env_path}/nvvm/bin/cicc")
+    else:
+        # Disable CMake's find_package(CUDA) entirely. This makes gerbil's
+        # CMakeLists.txt take the CUDA_FOUND=FALSE branch: no -DGPU define,
+        # no .cu compilation, no CUDA libraries linked.
+        cmake_args.append("-DCMAKE_DISABLE_FIND_PACKAGE_CUDA=TRUE")
+        print_info("Running cmake WITHOUT CUDA – gerbil will be CPU only.")
+
+    print_info("Forcing conda zlib/bzip2 (not system libraries)...")
+    cmake_args.extend([
+        "-S", gerbil_source_abs,
+        "-B", build_dir_abs,
+    ])
+
     try:
-        subprocess.run(
-            [
-                cmake_bin,
-                f"-DCUDA_TOOLKIT_ROOT_DIR={cuda_root}",
-                f"-DZLIB_ROOT={env_path}",
-                f"-DZLIB_LIBRARY={env_path}/lib/libz.so",
-                f"-DZLIB_INCLUDE_DIR={env_path}/include",
-                f"-DBZIP2_ROOT={env_path}",
-                f"-DBZIP2_LIBRARIES={env_path}/lib/libbz2.so",
-                f"-DBZIP2_INCLUDE_DIR={env_path}/include",
-                "-S", gerbil_source_abs,
-                "-B", build_dir_abs,
-            ],
-            check=True,
-            env=my_env
-        )
-        # Check if CUDA was actually found in cmake output
+        subprocess.run(cmake_args, check=True, env=my_env)
         print_success("CMake configuration successful!")
     except subprocess.CalledProcessError as e:
         print_error(f"CMake failed with code {e.returncode}")
-        print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
-        print_colored("  ⚠  GERBIL GPU WARNING", Colors.YELLOW, bold=True)
-        print_colored("="*70, Colors.YELLOW, bold=True)
-        print_warning("  CMake could not configure gerbil with CUDA.")
-        print_warning("  Gerbil will NOT use the GPU – CPU only mode.")
-        print_colored("="*70, Colors.YELLOW, bold=True)
+        if enable_gpu:
+            print_colored("\n" + "="*70, Colors.YELLOW, bold=True)
+            print_colored("  ⚠  GERBIL GPU WARNING", Colors.YELLOW, bold=True)
+            print_colored("="*70, Colors.YELLOW, bold=True)
+            print_warning("  CMake could not configure gerbil with CUDA.")
+            print_warning("  Try installing without --gerbil-gpu for a CPU-only build.")
+            print_colored("="*70, Colors.YELLOW, bold=True)
         return False
 
     # Make
@@ -998,9 +1043,16 @@ def build_gerbil(env_path, force_rebuild=False):
 
     # Verify binary
     binary_abs = os.path.abspath(GERBIL_BINARY)
+    marker_abs = os.path.abspath(GERBIL_GPU_MARKER)
     if os.path.isfile(binary_abs):
         os.chmod(binary_abs, 0o755)
-        print_success(f"gerbil binary ready: {binary_abs}")
+        # Write/remove the GPU marker so the runtime knows the compile mode.
+        if enable_gpu:
+            with open(marker_abs, "w") as f:
+                f.write("gerbil compiled with CUDA/GPU support\n")
+        elif os.path.isfile(marker_abs):
+            os.remove(marker_abs)
+        print_success(f"gerbil binary ready: {binary_abs}  [{mode_label}]")
         return True
     else:
         print_error(f"Binary not found at {binary_abs} – build may have failed")
@@ -1016,13 +1068,29 @@ def show_usage():
     print_colored("  KMX Setup Tool – Environment Installer", Colors.CYAN, bold=True)
     print_colored("="*70, Colors.CYAN, bold=True)
     print_colored("\nUSAGE:", Colors.YELLOW, bold=True)
-    print_colored("  python setup.py install    ", Colors.GREEN, end="")
-    print_colored("– Create KMX-env with all packages", Colors.RESET)
-    print_colored("  python setup.py uninstall  ", Colors.GREEN, end="")
+    print_colored("  python setup.py install                ", Colors.GREEN, end="")
+    print_colored("– Create KMX-env (gerbil built CPU-only)", Colors.RESET)
+    print_colored("  python setup.py install --gerbil-gpu   ", Colors.GREEN, end="")
+    print_colored("– Same, but compile gerbil with CUDA/GPU support", Colors.RESET)
+    print_colored("  python setup.py uninstall              ", Colors.GREEN, end="")
     print_colored("– Remove KMX-env", Colors.RESET)
-    print_colored("  python setup.py verify     ", Colors.GREEN, end="")
+    print_colored("  python setup.py verify                 ", Colors.GREEN, end="")
     print_colored("– Check installation health", Colors.RESET)
     print()
+
+
+def _parse_install_args(argv):
+    p = argparse.ArgumentParser(
+        prog="setup.py install",
+        description="Install the KMX-env conda environment and build gerbil-DataFrame.",
+    )
+    p.add_argument(
+        "--gerbil-gpu",
+        action="store_true",
+        default=False,
+        help="Compile gerbil with CUDA/GPU support. Default is CPU-only.",
+    )
+    return p.parse_args(argv)
 
 
 def main():
@@ -1032,7 +1100,8 @@ def main():
 
     command = sys.argv[1].lower()
     if command == "install":
-        return install()
+        args = _parse_install_args(sys.argv[2:])
+        return install(gerbil_gpu=args.gerbil_gpu)
     elif command == "uninstall":
         return uninstall()
     elif command == "verify":

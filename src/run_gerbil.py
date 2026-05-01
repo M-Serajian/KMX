@@ -8,6 +8,44 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 GERBIL_EXECUTABLE = os.path.join(CURRENT_DIR, '..', 'include', 'gerbil-DataFrame', 'build', 'gerbil')
 GERBIL_EXECUTABLE = os.path.abspath(GERBIL_EXECUTABLE)
 
+# Marker file written by setup.py when gerbil was built with CUDA/GPU support.
+# Sits next to the gerbil binary in include/gerbil-DataFrame/build/.gerbil_gpu
+GERBIL_GPU_MARKER = os.path.join(os.path.dirname(GERBIL_EXECUTABLE), '.gerbil_gpu')
+
+# Cache the "did we already warn the user?" state so we don't spam logs.
+_GPU_FALLBACK_WARNED = False
+
+
+def gerbil_built_with_gpu():
+    """Return True if gerbil was compiled with CUDA/GPU support.
+
+    Detected via the marker file written by setup.py at build time.
+    """
+    return os.path.isfile(GERBIL_GPU_MARKER)
+
+
+def _resolve_gpu_flag(enable_gpu):
+    """Decide whether to pass -g to gerbil based on user request and build mode.
+
+    Returns True only when both the user wants GPU AND gerbil was compiled with
+    GPU support. Logs a one-time warning if the user wants GPU but gerbil is
+    CPU-only.
+    """
+    global _GPU_FALLBACK_WARNED
+    if not enable_gpu:
+        return False
+    if gerbil_built_with_gpu():
+        return True
+    if not _GPU_FALLBACK_WARNED:
+        print(
+            "Warning: gerbil was compiled CPU-only; ignoring GPU request and "
+            "running gerbil on CPU. To enable GPU, reinstall with: "
+            "python setup.py install --gerbil-gpu",
+            flush=True,
+        )
+        _GPU_FALLBACK_WARNED = True
+    return False
+
 
 def _get_gerbil_env():
     """Build an environment dict that includes conda's lib directory in LD_LIBRARY_PATH.
@@ -44,15 +82,15 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
         "-o", "csv",
         "-l", str(min_threshold),
         "-z", str(max_threshold)]
-    
-    if enable_gpu:
+
+    if _resolve_gpu_flag(enable_gpu):
         command.append("-g")
-    
+
     if disable_normalization:
         command.append("-d")
-    
+
     command.extend([genome_file, temp_directory, output_directory])
-    
+
     try:
         result = subprocess.run(command, check=True, text=True, capture_output=True, env=_get_gerbil_env())
         print(f"Unique k-mers successfully extracted and stored at: {output_directory}")
@@ -72,13 +110,13 @@ def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, di
         "-o", "csv",
         "-l", str(1),
         "-z", str(10**9)]
-    
-    if enable_gpu:
+
+    if _resolve_gpu_flag(enable_gpu):
         command.append("-g")
 
     if disable_normalization:
         command.append("-d")
-    
+
     command.extend([genome_dir, tmp_dir, output_file])
     
     result = subprocess.run(command, check=True, text=True, capture_output=True, env=_get_gerbil_env())
