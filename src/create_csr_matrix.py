@@ -100,11 +100,12 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
             # print(f"Number of non-zero elements so far {current_position}",flush=True)
     
     last_value = row[-1]
-    
+
     #Index for each K-mer
     df_comp = set_of_all_unique_kmers_dataframe.reset_index()
 
-    sparsity=100-density
+    total_cells = len(set_of_all_unique_kmers_dataframe) * len(genome_dirs)
+    sparsity = (1 - last_value / total_cells) * 100 if total_cells > 0 else 0.0
     #csr_matrix = cupyx.scipy.sparse.csr_matrix((data[:last_value],column[:last_value],cp.asarray(row)))
 
     return data[:last_value] , column[:last_value] , cp.asarray(row) , df_comp , sparsity
