@@ -99,21 +99,36 @@ def check_output_directory(directory: str) -> str:
     return directory
 
 
-def count_inputs_in_genome_list(genome_list_path: str) -> int:
+def count_genomes_in_manifest(manifest_path: str) -> int:
     """
-    Count the number of FASTA file paths in the genome list file.
-    Ignores blank lines and lines starting with '#'.
+    Count the number of distinct sample_ids in the manifest CSV.
+
+    Used to compute the default for --max (= N/2 unique genomes). Performs
+    a permissive scan: skips blank lines, '#' comments, and the header row;
+    does not validate paths or extensions (the full parser does that later).
     """
+    import csv as _csv
+
     n = 0
+    seen: set = set()
     try:
-        with open(genome_list_path, "r") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
+        with open(manifest_path, "r", newline="") as f:
+            reader = _csv.reader(f)
+            header_seen = False
+            for row in reader:
+                if not row:
                     continue
-                n += 1
+                first = row[0].strip()
+                if not first or first.startswith("#"):
+                    continue
+                if not header_seen:
+                    header_seen = True
+                    continue
+                if first not in seen:
+                    seen.add(first)
+                    n += 1
     except Exception as e:
-        print(_c(f"Error: Could not read genome list file '{genome_list_path}'. Reason: {e}", RED),
+        print(_c(f"Error: Could not read manifest file '{manifest_path}'. Reason: {e}", RED),
               file=sys.stderr, flush=True)
         sys.exit(1)
     return n
@@ -127,19 +142,26 @@ def parse_arguments():
 
     parser.add_argument(
         "-l", "--genome-list", type=str, required=True,
-        help="Path to a text file containing FASTA file paths (required)."
+        help=("Path to the input manifest CSV (required). Long format with "
+              "two columns: sample_id,file. One row per file. Multiple files "
+              "for the same genome are listed as multiple rows sharing the "
+              "same sample_id; KMC merges them at count time. Accepts FASTA "
+              "(.fa/.fasta/.fna/.faa) or FASTQ (.fq/.fastq), each optionally "
+              "gzipped (.gz). The whole manifest must be one format family. "
+              "See README's Input Format section for full schema.")
     )
 
     parser.add_argument(
-        "-min", dest="min", type=int, default=5,
+        "-min", "--min", dest="min", type=int, default=5,
         help="Minimum occurrence threshold for a k-mer to be retained (default: 5)."
     )
 
     parser.add_argument(
-        "-max", dest="max", type=int, default=None,
+        "-max", "--max", dest="max", type=int, default=None,
         help=("Maximum occurrence threshold for a k-mer to be retained. "
-              "If omitted, defaults to N/2 where N is the number of FASTA paths listed in --genome-list "
-              "(after ignoring blank lines and lines starting with '#').")
+              "If omitted, defaults to N/2 where N is the number of distinct "
+              "sample_ids in the manifest (i.e. number of genomes, not number "
+              "of files).")
     )
 
     parser.add_argument(
@@ -160,8 +182,23 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "-c", "--cpu", action="store_true", default=False,
-        help="Force CPU mode. If not specified, GPU acceleration is enabled by default."
+        "-T", "--threads", type=int, default=0,
+        help=("Total CPU threads. Stage 1 (global k-mer reference) uses all of them "
+              "as kmcpy multi-threading; Stage 2 launches one worker process per "
+              "thread and counts each genome on a single CPU. 0 = use all "
+              "available cores (default).")
+    )
+
+    parser.add_argument(
+        "--max-ram-gb", dest="max_ram_gb", type=float, default=0.0,
+        help=("Cap on CPU-RAM accumulation of per-genome CSR data. When the "
+              "total bytes held in RAM during stage 2 exceed this value, the "
+              "accumulated chunk is flushed to disk under <tmp_dir> and "
+              "reloaded at the final assembly step. 0 = no cap (everything "
+              "stays in RAM, default). Use a small value (e.g. 0.1) to "
+              "force disk-spill paths during testing. The GPU is already "
+              "kept low (~0.5 GB) by the always-on tier-1 spill, so this "
+              "flag manages CPU RAM, not VRAM.")
     )
 
     parser.add_argument(
@@ -176,7 +213,7 @@ def parse_arguments():
 
     # Compute dynamic default for --max if not provided
     if args.max is None:
-        n_inputs = count_inputs_in_genome_list(args.genome_list)
+        n_inputs = count_genomes_in_manifest(args.genome_list)
         args.max = max(1, n_inputs // 2)
 
     # Validate min/max relationship

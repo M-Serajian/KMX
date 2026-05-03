@@ -1,0 +1,48 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "KMX"
+version         = "2.0.0.dev0"
+description     = "GPU-accelerated genome × k-mer CSR matrix builder (KMC-DataFrame + cuDF/CuPy)."
+readme          = "README.md"
+license         = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Mohammadali (Ali) Serajian", email = "ma.serajian@gmail.com" },
+]
+keywords        = ["k-mer", "bioinformatics", "genomics", "GPU", "RAPIDS", "KMC"]
+classifiers     = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Operating System :: POSIX :: Linux",
+]
+
+# Core runtime dependencies. cuDF / CuPy are *not* listed here — they must be
+# installed via the RAPIDS conda channel; they are not pip-installable on most
+# clusters. The README documents the conda env setup.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "kmcpy @ git+https://github.com/M-Serajian/KMC-DataFrame.git",
+]
+
+[project.urls]
+Homepage   = "https://github.com/M-Serajian/KMX"
+Repository = "https://github.com/M-Serajian/KMX"
+Issues     = "https://github.com/M-Serajian/KMX/issues"
+
+[project.scripts]
+KMX = "KMX.cli:main"
+
+# Source files live directly in `src/` (no nested KMX/ subdir).
+# setuptools registers them under the import name `KMX` via this mapping.
+[tool.setuptools]
+packages    = ["KMX"]
+package-dir = { "KMX" = "src" }

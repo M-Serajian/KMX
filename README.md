@@ -10,9 +10,11 @@
 
 ## Overview
 
-KMX is a high-performance, GPU-accelerated tool for extracting k-mers from large genomic datasets and constructing the corresponding feature matrix in **Compressed Sparse Row (CSR)** format. Given a list of genomes in FASTA format, KMX:
+KMX is a high-performance, GPU-accelerated tool for extracting k-mers from large genomic datasets and constructing the corresponding feature matrix in **Compressed Sparse Row (CSR)** format. Given a manifest CSV that maps each genome to one or more input files, KMX:
 
-- Extracts k-mers from each genome using [gerbil-DataFrame](https://github.com/M-Serajian/gerbil-DataFrame), a CUDA-enabled k-mer counter forked from [Gerbil](https://github.com/uni-halle/gerbil).
+- Accepts both **FASTA** assemblies (`.fa`, `.fasta`, `.fna`, `.faa`) and **FASTQ** sequencing reads (`.fq`, `.fastq`), each optionally **gzipped** (`.gz`).
+- Supports multiple files per genome — paired-end reads, multi-lane runs, multi-contig assemblies — by merging counts at the KMC layer with no Python-side reduction.
+- Counts k-mers via [KMC-DataFrame (kmcpy)](https://github.com/M-Serajian/KMC-DataFrame), a Python wrapper around [KMC](https://github.com/refresh-bio/KMC) that returns counts directly as `pandas.DataFrame`.
 - Constructs a CSR matrix where rows represent genomes and columns represent unique k-mers, with frequency values as entries.
 - Leverages GPU acceleration through [RAPIDS cuDF](https://github.com/rapidsai/cudf) and [CuPy](https://cupy.dev/) for fast, memory-efficient DataFrame operations and sparse matrix assembly.
 - Scales to large datasets with dynamic memory management and parallel processing.
@@ -255,6 +257,135 @@ ls -lh include/gerbil-DataFrame/build/gerbil
 
 ---
 
+## Input Format
+
+KMX takes a single **manifest CSV** that lists the input files for every genome. The schema is intentionally small — two columns, long format — and is independent of how files are laid out on disk.
+
+### Schema
+
+```csv
+sample_id,file
+GENOME_A,/path/to/file1
+GENOME_A,/path/to/file2
+GENOME_B,/path/to/file3
+```
+
+- **Header row required**: `sample_id,file` (case-insensitive, exactly two columns).
+- **`sample_id`**: a label you choose for each genome. It is just a string — KMX does *not* expect a directory or filename to match it. Identical strings group rows together; different strings produce different output rows. String comparison is case-sensitive (`GENOME_A` ≠ `genome_a`).
+- **`file`**: an absolute path, or a path relative to the manifest CSV's directory. The file must exist at parse time.
+- One row per file. **Multiple files for the same genome are written as multiple rows sharing the same `sample_id`** — KMC merges their counts internally during stage 2, so paired-end pairs and multi-lane runs collapse into a single combined k-mer profile per genome with no special handling.
+- Blank lines and lines beginning with `#` are skipped.
+- Trailing whitespace and surrounding spaces in cells are stripped.
+- Duplicate `(sample_id, file)` rows are silently deduplicated.
+
+### Supported file types
+
+| Extension | Family | What KMX passes to KMC |
+|-----------|--------|------------------------|
+| `.fa`, `.fasta`, `.fna`, `.faa` | FASTA | `-fm` (multi-line FASTA) |
+| `.fa.gz`, `.fasta.gz`, `.fna.gz`, `.faa.gz` | FASTA | `-fm` (gzip auto-detected by KMC) |
+| `.fq`, `.fastq` | FASTQ | `-fq` |
+| `.fq.gz`, `.fastq.gz` | FASTQ | `-fq` (gzip auto-detected by KMC) |
+
+KMX detects the family from the extension. Within a family, **gzipped and plain files can be freely mixed** — KMC reads the magic bytes and decompresses on the fly. Anything outside this list is rejected at parse time with a clear error.
+
+> **Format-family rule:** the **whole manifest** must be one family — all FASTA-like or all FASTQ-like. KMX cannot mix the two because stage 1 (the global reference k-mer pass) issues a single KMC call across every input file, and KMC requires one input format per call. Mixing FASTA assemblies with FASTQ reads will produce an error at startup naming the first offending row of each family.
+
+### Examples
+
+**Pure FASTA, one assembly per genome (the simple case):**
+
+```csv
+sample_id,file
+GCF_000001405,/data/refs/grch38.fa.gz
+GCA_000146045,/data/refs/yeast.fasta
+my_assembly,/results/scaffolds.fna
+```
+
+**Pure FASTQ, paired-end and multi-run mixed:**
+
+```csv
+sample_id,file
+SAMPLE_A,/reads/A_R1.fq.gz
+SAMPLE_A,/reads/A_R2.fq.gz
+SAMPLE_B,/reads/B_lane1_R1.fastq.gz
+SAMPLE_B,/reads/B_lane1_R2.fastq.gz
+SAMPLE_B,/reads/B_lane2_R1.fastq.gz
+SAMPLE_B,/reads/B_lane2_R2.fastq.gz
+SAMPLE_C,/reads/C_single_end.fq
+```
+
+`SAMPLE_A` ends up with one row in the output matrix combining both R1 and R2. `SAMPLE_B` similarly combines four files (two paired-end runs). `SAMPLE_C` has only one file. All three coexist in one manifest with no special syntax.
+
+**Files in a flat directory with arbitrary names** — KMX does not require any per-genome subdirectories:
+
+```csv
+sample_id,file
+GENOME_A,/data/all_reads/SRR1234567_1.fq.gz
+GENOME_A,/data/all_reads/SRR1234567_2.fq.gz
+GENOME_A,/data/all_reads/SRR9999999_1.fq.gz
+GENOME_A,/data/all_reads/SRR9999999_2.fq.gz
+GENOME_B,/data/all_reads/SRR2222222_1.fq.gz
+GENOME_B,/data/all_reads/SRR2222222_2.fq.gz
+```
+
+**Comments and relative paths are fine:**
+
+```csv
+# Cohort A — sequencing run 2026-04
+sample_id,file
+isolate_001,reads/iso001_R1.fq.gz
+isolate_001,reads/iso001_R2.fq.gz
+
+# Cohort B — added later
+isolate_002,reads/iso002_R1.fq.gz
+isolate_002,reads/iso002_R2.fq.gz
+```
+
+When the path is relative (e.g. `reads/iso001_R1.fq.gz`), it resolves against the manifest's directory — *not* the shell's current working directory — so the manifest stays portable when carried alongside the data.
+
+### Building a manifest programmatically
+
+For large datasets, generate the manifest with a shell or Python loop rather than typing it by hand:
+
+```bash
+echo "sample_id,file" > manifest.csv
+for d in /data/genomes/*/; do
+  id=$(basename "$d")
+  for f in "$d"/*.fastq.gz; do
+    echo "$id,$f"
+  done
+done >> manifest.csv
+```
+
+```python
+import csv, os, glob
+
+with open("manifest.csv", "w", newline="") as fh:
+    w = csv.writer(fh)
+    w.writerow(("sample_id", "file"))
+    for d in sorted(glob.glob("/data/genomes/*/")):
+        sid = os.path.basename(d.rstrip("/"))
+        for f in sorted(glob.glob(os.path.join(d, "*.fastq.gz"))):
+            w.writerow((sid, f))
+```
+
+### Errors you can expect
+
+KMX validates the manifest fully before any KMC subprocess is launched. Examples of errors and their causes:
+
+| Error message fragment | Cause |
+|------------------------|-------|
+| `expected header 'sample_id,file'` | First non-comment row is not the header. |
+| `manifest mixes FASTA and FASTQ inputs` | Both families are present. Split into two manifests. |
+| `unrecognized extension on …` | A file has an extension outside the supported list. |
+| `file does not exist: …` | A path in the manifest cannot be resolved. |
+| `sample_id cell is empty` | A row has nothing in the `sample_id` column. |
+| `only 2 columns are allowed` | Extra non-empty cells past column 2. (Multiple files per genome → multiple rows, not extra columns.) |
+| `header present but no data rows found` | Manifest has a header but no usable rows. |
+
+---
+
 ## Usage
 
 Activate the environment before running KMX:
@@ -266,27 +397,34 @@ conda activate KMX-env
 ### Command
 
 ```bash
-python KMX.py -l <genome_list> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
+KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
+```
+
+`KMX` is the installed console script (declared in `pyproject.toml`). You can also run the package directly:
+
+```bash
+python -m KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
 ```
 
 ### Arguments
 
 | Flag | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `-l`, `--genome-list` | str | **yes** | — | Path to a text file listing one FASTA file path per line. Blank lines and lines starting with `#` are ignored. |
+| `-l`, `--genome-list` | path | **yes** | — | Path to the input manifest CSV (long format with `sample_id,file` columns). See the **Input Format** section above. |
 | `-k`, `--kmer-size` | int | **yes** | — | K-mer length. Must be between **8** and **136** (inclusive). |
 | `-t`, `--tmp` | path | **yes** | — | Temporary directory for intermediate files. Created if absent. Must have ≥ 10 GB free. |
 | `-o`, `--output` | path | **yes** | — | Output directory for results. Created if absent. |
-| `--min` | int | no | `5` | Minimum k-mer occurrence threshold. K-mers seen fewer times are discarded. |
-| `--max` | int | no | `N/2` | Maximum k-mer occurrence threshold. Defaults to half the number of genomes. Must satisfy `max ≥ min`. |
+| `--min` | int | no | `5` | Minimum k-mer occurrence threshold. K-mers seen fewer times across the whole dataset are discarded. |
+| `--max` | int | no | `N/2` | Maximum k-mer occurrence threshold. Defaults to half the number of **genomes** (distinct `sample_id`s in the manifest), not files. Must satisfy `max ≥ min`. |
 | `-d`, `--disable-normalization` | flag | no | off | Treat a k-mer and its reverse complement as distinct features. By default both map to the same canonical k-mer. |
-| `-c`, `--cpu` | flag | no | off | Force CPU-only execution. By default GPU acceleration is used. |
+| `-T`, `--threads` | int | no | `0` | Total CPU threads. `0` = all available cores. |
+| `--max-ram-gb` | float | no | `0.0` | Cap on CPU RAM accumulation of per-genome CSR data. `0` = unbounded. |
 
 ### Example
 
 ```bash
-python KMX.py \
-    -l genomes.txt \
+KMX \
+    -l manifest.csv \
     -k 31 \
     -t /scratch/tmp \
     -o /results/output \
@@ -306,6 +444,7 @@ All output files are written to the directory specified by `-o`. File names incl
 | `row_<suffix>.npy` | NumPy `.npy` | Row pointer array of the CSR matrix. |
 | `column_<suffix>.npy` | NumPy `.npy` | Column index array of the CSR matrix. |
 | `set_of_all_unique_kmers_<suffix>.csv` | CSV | Mapping of column indices to canonical k-mer strings. |
+| `genome_index_<suffix>.csv` | CSV | Mapping of CSR row indices to `sample_id`. Row order matches first-appearance order in the manifest. |
 | `feature_matrix_stats_<suffix>.txt` | Text | Run statistics: sparsity, parameters, timing, and peak GPU memory usage. |
 
 ### Reconstructing the CSR Matrix
