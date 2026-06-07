@@ -2,505 +2,205 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)]()
-[![CUDA: 12.8](https://img.shields.io/badge/CUDA-12.8-green.svg)]()
-[![Python: 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)]()
-[![RAPIDS: 25.06](https://img.shields.io/badge/RAPIDS-25.06-orange.svg)]()
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)]()
+[![RAPIDS cuDF](https://img.shields.io/badge/RAPIDS-cuDF-orange.svg)]()
+
+KMX turns a set of genomes into a **genome × k-mer count matrix** in sparse **CSR** format.
+You give it a manifest that maps each genome to its sequence file(s); KMX counts k-mers
+([KMC](https://github.com/refresh-bio/KMC) via [kmcpy](https://github.com/M-Serajian/KMC-DataFrame)),
+merges them against the global k-mer set on the GPU ([cuDF](https://github.com/rapidsai/cudf)/[CuPy](https://cupy.dev/)),
+and writes the matrix to disk.
+
+**What makes it scale:** the matrix is built **out-of-core** — genomes are counted in parallel on the CPU,
+streamed through the GPU one at a time, and written to disk **in input order** within an **automatic memory budget**.
+Peak GPU and host memory stay bounded *regardless of dataset size*, so even datasets whose matrix is far larger
+than RAM or VRAM run on a modest box.
 
 ---
 
-## Overview
+## Requirements
 
-KMX is a high-performance, GPU-accelerated tool for extracting k-mers from large genomic datasets and constructing the corresponding feature matrix in **Compressed Sparse Row (CSR)** format. Given a manifest CSV that maps each genome to one or more input files, KMX:
-
-- Accepts both **FASTA** assemblies (`.fa`, `.fasta`, `.fna`, `.faa`) and **FASTQ** sequencing reads (`.fq`, `.fastq`), each optionally **gzipped** (`.gz`).
-- Supports multiple files per genome — paired-end reads, multi-lane runs, multi-contig assemblies — by merging counts at the KMC layer with no Python-side reduction.
-- Counts k-mers via [KMC-DataFrame (kmcpy)](https://github.com/M-Serajian/KMC-DataFrame), a Python wrapper around [KMC](https://github.com/refresh-bio/KMC) that returns counts directly as `pandas.DataFrame`.
-- Constructs a CSR matrix where rows represent genomes and columns represent unique k-mers, with frequency values as entries.
-- Leverages GPU acceleration through [RAPIDS cuDF](https://github.com/rapidsai/cudf) and [CuPy](https://cupy.dev/) for fast, memory-efficient DataFrame operations and sparse matrix assembly.
-- Scales to large datasets with dynamic memory management and parallel processing.
-
-The resulting CSR matrix integrates directly into machine learning workflows via `cupyx.scipy.sparse.csr_matrix` (GPU) or `scipy.sparse.csr_matrix` (CPU), making KMX well-suited for genomic feature extraction, clustering, classification, and other bioinformatics applications in high-performance computing (HPC) environments.
-
----
-
-## K-mer Size
-
-KMX supports k-mer sizes from **8 to 136** (inclusive). This range is inherited from the underlying [Gerbil](https://github.com/uni-halle/gerbil) k-mer counter, which encodes k-mers in a fixed-width binary representation with a compiled maximum of 136.
-
----
-
-## Platform Support
-
-**KMX runs on Linux only.** [RAPIDS cuDF](https://rapids.ai/), which KMX depends on for GPU-accelerated DataFrame operations, is exclusively available on Linux. There is no Windows or macOS support.
-
----
-
-## Hardware Requirements
-
-| Component | Requirement |
-|-----------|-------------|
-| **OS** | Linux (Ubuntu 20.04+ recommended) |
-| **GPU** | NVIDIA GPU with CUDA support |
-| **CUDA Driver** | Compatible with CUDA 12.8.1 (see note below) |
-| **VRAM** | Depends on dataset size |
-| **RAM** | Depends on dataset size |
-| **Disk** | ≥ 10 GB free for temporary files; ~10 GB for installation |
-
-> ⚠️ **CUDA Version Notice**
->
-> KMX has been fully tested and confirmed working with **CUDA 12.8.1**.
->
-> Higher CUDA versions (12.9+) have been tested but are **not fully supported** at this time. Specifically, the gerbil-DataFrame component encounters compilation issues with CUDA versions beyond 12.8.1. Until this is resolved, **CUDA 12.8.1 is the recommended and supported version**.
->
-> If you are on an HPC cluster with a module system, ensure you load the correct version:
-> ```bash
-> module load cuda/12.8.1
-> ```
-
----
-
-## Citation
-
-If you use KMX in your research, please cite:
-
-> **Serajian M.**, *et al.* **"KMX: GPU-Accelerated K-mer Matrix Constructor."** *Journal Name*, **Volume** (Year): pages. DOI: xx.xxxx/xxxxxxxx
+- **Linux** (RAPIDS cuDF is Linux-only) with an **NVIDIA GPU** (CUDA 12.x).
+- **Python ≥ 3.10**, and **RAPIDS cuDF/CuPy** (installed via conda — not pip-installable on most clusters).
+- Tested with **cuDF 25.06 / CUDA 12.8**.
+- K-mer size **8–136**.
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-| Prerequisite | Version | Notes |
-|-------------|---------|-------|
-| **Linux** | any | Required. RAPIDS cuDF is Linux-only. |
-| **NVIDIA GPU + Driver** | CUDA 12.8.1 | See CUDA version notice above. |
-| **Conda or Mamba** | any | Required for automated installation. Install from [Miniforge](https://github.com/conda-forge/miniforge) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html). |
-| **Git** | any | Required to clone the repository. |
-| **GCC** | ≤ 13 (12.2.0 recommended) | gerbil-DataFrame does **not** compile with GCC 14+. GCC 12.2.0 is tested and confirmed working. |
-
----
-
-### Option 1: Automated Installation with Conda (Recommended)
-
-This method creates a fully isolated Conda environment (`KMX-env`) with all dependencies and compiles gerbil-DataFrame automatically.
+KMX is a pip package; its only special dependency is **kmcpy** (a KMC C++ extension, built on install)
+and **cuDF/CuPy** (from the RAPIDS conda channel).
 
 ```bash
-# Clone the repository
-git clone https://github.com/M-Serajian/KMX.git
-cd KMX
-
-# Run the setup script
-python setup.py install
-```
-
-The setup script will automatically:
-
-1. Detect your GPU and CUDA driver version (requires CUDA 12.8.1+)
-2. Check available disk space (~10 GB required)
-3. Create a Conda environment named `KMX-env` with all exact versions:
-   - Python 3.11.14
-   - RAPIDS cuDF 25.06
-   - CUDA Toolkit 12.8
-   - GCC / G++ 12.2.0
-   - Boost 1.77.0
-   - CMake 4.2.3
-   - zlib 1.3.1, bzip2 1.0.8
-4. Clone [gerbil-DataFrame](https://github.com/M-Serajian/gerbil-DataFrame) into `include/`
-5. Compile gerbil with full CUDA GPU support
-
-**Estimated time:** 15–20 minutes (CUDA Toolkit download is large).
-
-After installation, verify everything is working:
-
-```bash
-python setup.py verify
-```
-
-#### Maintenance Commands
-
-```bash
-# Verify installation health
-python setup.py verify
-
-# Recompile gerbil only (if build had errors)
-python setup.py install        # will prompt: skip or recompile
-
-# Recreate the entire environment from scratch
-python setup.py uninstall
-python setup.py install
-
-# Remove KMX-env and gerbil-DataFrame completely
-python setup.py uninstall
-
-# Free disk space from conda package cache
-conda clean --all -y
-```
-
-> ℹ️ `python setup.py uninstall` removes **both** the `KMX-env` conda environment **and** the `include/gerbil-DataFrame` directory.
-
----
-
-### Option 2: Manual Installation
-
-Use this if you prefer to manage dependencies yourself or are working in an HPC environment with a module system.
-
-#### Dependency Versions
-
-The versions listed below are **recommended and confirmed working**. Other versions may work under certain conditions, but violating the hard constraints listed below will cause build or runtime failures.
-
-| Dependency | Recommended Version | Hard Constraint | Notes |
-|-----------|---------------------|-----------------|-------|
-| Python | 3.11.14 | Must match RAPIDS build | Other 3.11.x patch versions will likely work; 3.12+ is untested with RAPIDS 25.06 |
-| GCC / G++ | 12.2.0 | **Must be ≤ GCC 13** | **GCC 14+ is incompatible with gerbil-DataFrame and will cause compilation errors.** GCC 11.x and 13.x may work but are untested. |
-| CMake | 4.2.3 | Must be ≥ 3.5 | CMake 4.x requires patching gerbil's `CMakeLists.txt` line 1 to `VERSION 3.5` — the setup script does this automatically. CMake 3.x (≥ 3.5) will also work. |
-| Boost | 1.77.0 | 1.77.x strongly recommended | Other Boost versions may introduce ABI incompatibilities or build errors in gerbil. If using a different version, pass `-DBOOST_ROOT` explicitly to CMake. |
-| CUDA Toolkit | 12.8.1 | **Must be ≤ 12.8.x** | **CUDA 12.9+ has known incompatibilities with gerbil-DataFrame.** CUDA 12.8.1 is the highest tested and supported version. Lower 12.x versions may work but are untested. |
-| RAPIDS cuDF | 25.06 | Must match CUDA version | cuDF 25.06 is the latest version confirmed working with CUDA 12.8. cuDF 25.12+ requires CUDA 13 which breaks gerbil. |
-| CuPy | installed with cuDF | — | Installed automatically as a cuDF dependency. Do not install separately. |
-| zlib | 1.3.1 | Must come from the same source (conda or system) | **Do not mix conda and system zlib.** If CMake picks up `/usr/lib64/libz.so` instead of conda's, you will get `cmath` errors in gerbil. Pass `-DZLIB_ROOT` explicitly. |
-| libbz2 | 1.0.8 | Must come from the same source (conda or system) | Same mixing warning as zlib above. Pass `-DBZIP2_ROOT` explicitly if needed. |
-| Git | any | — | Only needed to clone gerbil-DataFrame. |
-
-> ⚠️ **Library Isolation Warning**
->
-> When installing dependencies manually, be careful not to mix libraries from different sources:
->
-> - **Boost:** Use exactly Boost 1.77.0. Other versions may introduce build errors or ABI incompatibilities. Pass `-DBOOST_ROOT=/path/to/boost-1.77` to CMake if needed.
-> - **GCC:** Use the **same GCC version** throughout. Mixing compiler versions (e.g. compiling with GCC 12 but linking against GCC 14 libraries) causes `GLIBCXX` symbol errors at runtime.
-> - **CUDA:** RAPIDS cuDF ships its own CUDA runtime libraries. Conflicting versions on `LD_LIBRARY_PATH` can cause crashes. Keep CUDA 12.8.1 active throughout.
-> - **zlib / bzip2:** Use conda or system libraries — **do not mix them**. If cmake picks up system `/usr/lib64/libz.so` instead of the conda one, you will get `cmath` compilation errors in gerbil.
->
-> The automated Conda installation (Option 1) avoids all of these issues by isolating every dependency in a single environment.
-
-#### HPC Environment (Module System)
-
-```bash
-module load gcc/12.2
-module load cuda/12.8.1
-module load cmake/4.2
-module load boost/1.77
-module load python/3.11
-```
-
-> ⚠️ RAPIDS cuDF must be installed separately via Conda — it is not available as an HPC module.
-
-#### Ubuntu / Debian
-
-```bash
-sudo apt-get update && sudo apt-get install -y \
-    gcc-12 g++-12 \
-    cmake \
-    git \
-    libboost-all-dev \
-    zlib1g-dev \
-    libbz2-dev
-```
-
-> ⚠️ RAPIDS cuDF must be installed separately via [Conda](https://rapids.ai/start.html).
-
-#### Install RAPIDS cuDF via Conda
-
-```bash
+# 1. Create an environment with RAPIDS + the tools kmcpy needs to compile
 conda create -n KMX-env -c rapidsai -c conda-forge -c nvidia \
-    python=3.11.14 \
-    cudf=25.06 \
-    gcc_linux-64=12.2.0 \
-    gxx_linux-64=12.2.0 \
-    boost-cpp=1.77.0 \
-    cmake=4.2.3 \
-    cuda-version=12.8 \
-    zlib=1.3.1 \
-    bzip2=1.0.8 \
-    git make -y
-
+    python=3.11 cudf=25.06 cuda-version=12.8 \
+    gxx_linux-64 make zlib bzip2 git -y
 conda activate KMX-env
+
+# 2. Install KMX (also builds + installs kmcpy / KMC-DataFrame)
+pip install git+https://github.com/M-Serajian/KMX.git
 ```
 
-#### Build gerbil-DataFrame
+For development, clone and install editable:
 
 ```bash
-# Clone KMX and gerbil-DataFrame
 git clone https://github.com/M-Serajian/KMX.git
-cd KMX
-mkdir -p include && cd include
-git clone https://github.com/M-Serajian/gerbil-DataFrame.git
-cd gerbil-DataFrame
-
-# Patch cmake minimum version (required for CMake 4.x)
-sed -i '1s/.*/cmake_minimum_required(VERSION 3.5)/' CMakeLists.txt
-
-# Build
-mkdir -p build && cd build
-
-cmake .. \
-  -DCUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux \
-  -DZLIB_ROOT=$CONDA_PREFIX \
-  -DZLIB_LIBRARY=$CONDA_PREFIX/lib/libz.so \
-  -DZLIB_INCLUDE_DIR=$CONDA_PREFIX/include \
-  -DBZIP2_ROOT=$CONDA_PREFIX \
-  -DBZIP2_LIBRARIES=$CONDA_PREFIX/lib/libbz2.so \
-  -DBZIP2_INCLUDE_DIR=$CONDA_PREFIX/include
-
-make -j$(nproc)
-
-cd ../../..
+pip install -e KMX
 ```
 
-> ℹ️ The `-DCUDA_TOOLKIT_ROOT_DIR` flag is critical. Without it, CMake may find an incomplete CUDA installation (missing `cicc`) and the build will fail with `cicc: command not found`.
+> kmcpy build details (compilers, zlib/bzip2) are documented in the
+> [KMC-DataFrame repo](https://github.com/M-Serajian/KMC-DataFrame). If `pip` can't build it,
+> install kmcpy from there first, then `pip install` KMX.
 
-Verify the binary was built successfully:
-
-```bash
-ls -lh include/gerbil-DataFrame/build/gerbil
-```
-
----
-
-## Input Format
-
-KMX takes a single **manifest CSV** that lists the input files for every genome. The schema is intentionally small — two columns, long format — and is independent of how files are laid out on disk.
-
-### Schema
-
-```csv
-sample_id,file
-GENOME_A,/path/to/file1
-GENOME_A,/path/to/file2
-GENOME_B,/path/to/file3
-```
-
-- **Header row required**: `sample_id,file` (case-insensitive, exactly two columns).
-- **`sample_id`**: a label you choose for each genome. It is just a string — KMX does *not* expect a directory or filename to match it. Identical strings group rows together; different strings produce different output rows. String comparison is case-sensitive (`GENOME_A` ≠ `genome_a`).
-- **`file`**: an absolute path, or a path relative to the manifest CSV's directory. The file must exist at parse time.
-- One row per file. **Multiple files for the same genome are written as multiple rows sharing the same `sample_id`** — KMC merges their counts internally during stage 2, so paired-end pairs and multi-lane runs collapse into a single combined k-mer profile per genome with no special handling.
-- Blank lines and lines beginning with `#` are skipped.
-- Trailing whitespace and surrounding spaces in cells are stripped.
-- Duplicate `(sample_id, file)` rows are silently deduplicated.
-
-### Supported file types
-
-| Extension | Family | What KMX passes to KMC |
-|-----------|--------|------------------------|
-| `.fa`, `.fasta`, `.fna`, `.faa` | FASTA | `-fm` (multi-line FASTA) |
-| `.fa.gz`, `.fasta.gz`, `.fna.gz`, `.faa.gz` | FASTA | `-fm` (gzip auto-detected by KMC) |
-| `.fq`, `.fastq` | FASTQ | `-fq` |
-| `.fq.gz`, `.fastq.gz` | FASTQ | `-fq` (gzip auto-detected by KMC) |
-
-KMX detects the family from the extension. Within a family, **gzipped and plain files can be freely mixed** — KMC reads the magic bytes and decompresses on the fly. Anything outside this list is rejected at parse time with a clear error.
-
-> **Format-family rule:** the **whole manifest** must be one family — all FASTA-like or all FASTQ-like. KMX cannot mix the two because stage 1 (the global reference k-mer pass) issues a single KMC call across every input file, and KMC requires one input format per call. Mixing FASTA assemblies with FASTQ reads will produce an error at startup naming the first offending row of each family.
-
-### Examples
-
-**Pure FASTA, one assembly per genome (the simple case):**
-
-```csv
-sample_id,file
-GCF_000001405,/data/refs/grch38.fa.gz
-GCA_000146045,/data/refs/yeast.fasta
-my_assembly,/results/scaffolds.fna
-```
-
-**Pure FASTQ, paired-end and multi-run mixed:**
-
-```csv
-sample_id,file
-SAMPLE_A,/reads/A_R1.fq.gz
-SAMPLE_A,/reads/A_R2.fq.gz
-SAMPLE_B,/reads/B_lane1_R1.fastq.gz
-SAMPLE_B,/reads/B_lane1_R2.fastq.gz
-SAMPLE_B,/reads/B_lane2_R1.fastq.gz
-SAMPLE_B,/reads/B_lane2_R2.fastq.gz
-SAMPLE_C,/reads/C_single_end.fq
-```
-
-`SAMPLE_A` ends up with one row in the output matrix combining both R1 and R2. `SAMPLE_B` similarly combines four files (two paired-end runs). `SAMPLE_C` has only one file. All three coexist in one manifest with no special syntax.
-
-**Files in a flat directory with arbitrary names** — KMX does not require any per-genome subdirectories:
-
-```csv
-sample_id,file
-GENOME_A,/data/all_reads/SRR1234567_1.fq.gz
-GENOME_A,/data/all_reads/SRR1234567_2.fq.gz
-GENOME_A,/data/all_reads/SRR9999999_1.fq.gz
-GENOME_A,/data/all_reads/SRR9999999_2.fq.gz
-GENOME_B,/data/all_reads/SRR2222222_1.fq.gz
-GENOME_B,/data/all_reads/SRR2222222_2.fq.gz
-```
-
-**Comments and relative paths are fine:**
-
-```csv
-# Cohort A — sequencing run 2026-04
-sample_id,file
-isolate_001,reads/iso001_R1.fq.gz
-isolate_001,reads/iso001_R2.fq.gz
-
-# Cohort B — added later
-isolate_002,reads/iso002_R1.fq.gz
-isolate_002,reads/iso002_R2.fq.gz
-```
-
-When the path is relative (e.g. `reads/iso001_R1.fq.gz`), it resolves against the manifest's directory — *not* the shell's current working directory — so the manifest stays portable when carried alongside the data.
-
-### Building a manifest programmatically
-
-For large datasets, generate the manifest with a shell or Python loop rather than typing it by hand:
-
-```bash
-echo "sample_id,file" > manifest.csv
-for d in /data/genomes/*/; do
-  id=$(basename "$d")
-  for f in "$d"/*.fastq.gz; do
-    echo "$id,$f"
-  done
-done >> manifest.csv
-```
-
-```python
-import csv, os, glob
-
-with open("manifest.csv", "w", newline="") as fh:
-    w = csv.writer(fh)
-    w.writerow(("sample_id", "file"))
-    for d in sorted(glob.glob("/data/genomes/*/")):
-        sid = os.path.basename(d.rstrip("/"))
-        for f in sorted(glob.glob(os.path.join(d, "*.fastq.gz"))):
-            w.writerow((sid, f))
-```
-
-### Errors you can expect
-
-KMX validates the manifest fully before any KMC subprocess is launched. Examples of errors and their causes:
-
-| Error message fragment | Cause |
-|------------------------|-------|
-| `expected header 'sample_id,file'` | First non-comment row is not the header. |
-| `manifest mixes FASTA and FASTQ inputs` | Both families are present. Split into two manifests. |
-| `unrecognized extension on …` | A file has an extension outside the supported list. |
-| `file does not exist: …` | A path in the manifest cannot be resolved. |
-| `sample_id cell is empty` | A row has nothing in the `sample_id` column. |
-| `only 2 columns are allowed` | Extra non-empty cells past column 2. (Multiple files per genome → multiple rows, not extra columns.) |
-| `header present but no data rows found` | Manifest has a header but no usable rows. |
-
----
-
-## Usage
-
-Activate the environment before running KMX:
+Verify:
 
 ```bash
 conda activate KMX-env
+KMX --help
 ```
 
-### Command
+---
+
+## Quick Start
 
 ```bash
+KMX -l manifest.csv -k 31 -t /scratch/tmp -o results/ --min 5 --max 100
+```
+
+That's it — KMX sizes CPUs, GPU, and RAM automatically. Outputs land in `results/`.
+
+---
+
+## Input: the manifest
+
+A two-column CSV mapping each genome to its file(s):
+
+```csv
+sample_id,file
+GENOME_A,/data/A_R1.fq.gz
+GENOME_A,/data/A_R2.fq.gz     # same sample_id -> merged into one row
+GENOME_B,/data/B.fasta
+```
+
+- **`sample_id`** — any label; rows with the same label become **one matrix row** (KMC merges their counts).
+  So paired-end reads, multi-lane runs, and multi-contig assemblies are just multiple rows with the same `sample_id`.
+- **`file`** — absolute, or relative to the manifest's directory; must exist.
+- Header `sample_id,file` required. Blank lines and `#` comments are skipped; relative paths resolve next to the manifest.
+
+**Supported types:** FASTA (`.fa/.fasta/.fna/.faa`) and FASTQ (`.fq/.fastq`), each optionally `.gz`.
+**One family per manifest** — all FASTA *or* all FASTQ (KMX builds the global k-mer set with a single KMC call, which takes one format).
+
+The manifest is fully validated before any counting starts (clear errors for a missing file, wrong header, mixed families, or an unsupported extension).
+
+---
+
+## Options
+
+```
 KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
 ```
 
-`KMX` is the installed console script (declared in `pyproject.toml`). You can also run the package directly:
+| Flag | Req | Default | Description |
+|------|-----|---------|-------------|
+| `-l`, `--genome-list` | yes | — | Manifest CSV (`sample_id,file`). |
+| `-k`, `--kmer-size` | yes | — | K-mer length, **8–136**. |
+| `-t`, `--tmp` | yes | — | Scratch dir for intermediate files (created if absent). |
+| `-o`, `--output` | yes | — | Output dir (created if absent). |
+| `--min` | no | `5` | Drop k-mers occurring fewer than this many times across the dataset. |
+| `--max` | no | `N/2` | Drop k-mers occurring more than this (default: half the genome count). Must be ≥ `--min`. |
+| `-d`, `--disable-normalization` | no | off | Treat a k-mer and its reverse complement as distinct (default: canonical). |
+| `-T`, `--threads` | no | `0` | CPU threads; `0` = all cores. |
+| `--max-ram-gb` | no | `0` (auto) | Cap on host RAM for the in-memory accumulator before it spills to disk. `0` = auto from the cgroup/SLURM limit. |
 
-```bash
-python -m KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
-```
+### Automatic resource budgeting
 
-### Arguments
+KMX picks the worker count, threads-per-worker, and spill thresholds **automatically** from the cores, host RAM
+(cgroup/SLURM), and free VRAM it's given. No tuning needed. Three optional env vars override the defaults:
 
-| Flag | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `-l`, `--genome-list` | path | **yes** | — | Path to the input manifest CSV (long format with `sample_id,file` columns). See the **Input Format** section above. |
-| `-k`, `--kmer-size` | int | **yes** | — | K-mer length. Must be between **8** and **136** (inclusive). |
-| `-t`, `--tmp` | path | **yes** | — | Temporary directory for intermediate files. Created if absent. Must have ≥ 10 GB free. |
-| `-o`, `--output` | path | **yes** | — | Output directory for results. Created if absent. |
-| `--min` | int | no | `5` | Minimum k-mer occurrence threshold. K-mers seen fewer times across the whole dataset are discarded. |
-| `--max` | int | no | `N/2` | Maximum k-mer occurrence threshold. Defaults to half the number of **genomes** (distinct `sample_id`s in the manifest), not files. Must satisfy `max ≥ min`. |
-| `-d`, `--disable-normalization` | flag | no | off | Treat a k-mer and its reverse complement as distinct features. By default both map to the same canonical k-mer. |
-| `-T`, `--threads` | int | no | `0` | Total CPU threads. `0` = all available cores. |
-| `--max-ram-gb` | float | no | `0.0` | Cap on CPU RAM accumulation of per-genome CSR data. `0` = unbounded. |
-
-### Example
-
-```bash
-KMX \
-    -l manifest.csv \
-    -k 31 \
-    -t /scratch/tmp \
-    -o /results/output \
-    --min 5 \
-    --max 100
-```
+| Variable | Effect |
+|----------|--------|
+| `KMX_KMC_THREADS` | KMC threads per worker (default: `cores / workers`). |
+| `KMX_WORKER_SPILL_MB` | Per-genome table size above which a worker spills to disk (`0` = always in RAM). |
+| `KMX_SPILL_DIR` | Where disk-spill files go (default: `<tmp_dir>`). Point at a roomy/fast volume. |
 
 ---
 
-## Output Files
+## Output
 
-All output files are written to the directory specified by `-o`. File names include a suffix encoding the run parameters: `k{K}_min{MIN}_max{MAX}_d{0|1}`, where `d0` means normalization is enabled and `d1` means it is disabled.
+Written to `-o`, with a suffix `k{K}_min{MIN}_max{MAX}_d{0|1}` (`d1` = normalization disabled):
 
-| File | Format | Description |
-|------|--------|-------------|
-| `data_<suffix>.npy` | NumPy `.npy` | Non-zero values of the CSR matrix (k-mer frequencies). |
-| `row_<suffix>.npy` | NumPy `.npy` | Row pointer array of the CSR matrix. |
-| `column_<suffix>.npy` | NumPy `.npy` | Column index array of the CSR matrix. |
-| `set_of_all_unique_kmers_<suffix>.csv` | CSV | Mapping of column indices to canonical k-mer strings. |
-| `genome_index_<suffix>.csv` | CSV | Mapping of CSR row indices to `sample_id`. Row order matches first-appearance order in the manifest. |
-| `feature_matrix_stats_<suffix>.txt` | Text | Run statistics: sparsity, parameters, timing, and peak GPU memory usage. |
+| File | Description |
+|------|-------------|
+| `data_<suffix>.npy` | CSR non-zero values (counts). |
+| `column_<suffix>.npy` | CSR column indices. |
+| `row_<suffix>.npy` | CSR row pointers (row `i` = genome `i`, manifest order). |
+| `set_of_all_unique_kmers_<suffix>.csv` | Column index → k-mer string. |
+| `genome_index_<suffix>.csv` | Row index → `sample_id`. |
+| `feature_matrix_stats_<suffix>.txt` | Sparsity, parameters, processing time, peak GPU memory. |
 
-### Reconstructing the CSR Matrix
-
-```python
-# GPU (CuPy)
-import cupy as cp
-import cupyx.scipy.sparse
-
-data   = cp.load("data_k31_min5_max100_d0.npy")
-row    = cp.load("row_k31_min5_max100_d0.npy")
-column = cp.load("column_k31_min5_max100_d0.npy")
-matrix = cupyx.scipy.sparse.csr_matrix((data, column, row))
-```
+### Load the matrix
 
 ```python
-# CPU (SciPy)
-import numpy as np
-import scipy.sparse
-
-data   = np.load("data_k31_min5_max100_d0.npy")
-row    = np.load("row_k31_min5_max100_d0.npy")
-column = np.load("column_k31_min5_max100_d0.npy")
-matrix = scipy.sparse.csr_matrix((data, column, row))
+import numpy as np, scipy.sparse          # or: import cupy as np, cupyx.scipy.sparse as scipy_sparse
+s = "k31_min5_max100_d0"
+M = scipy.sparse.csr_matrix((
+        np.load(f"data_{s}.npy"),
+        np.load(f"column_{s}.npy"),
+        np.load(f"row_{s}.npy")))
 ```
+
+Use `cupy` + `cupyx.scipy.sparse` for the GPU version.
+
+---
+
+## Python API
+
+The whole pipeline is one function. **Call it inside `if __name__ == "__main__":`** — KMX uses
+multiprocessing (spawn), so an *unguarded* top-level call would re-spawn itself.
+
+```python
+import KMX
+
+if __name__ == "__main__":
+    data, column, row, kmers, sparsity = KMX.build(
+        "manifest.csv",
+        kmer_size=31,
+        tmp_dir="/scratch/tmp",
+        output_dir="results/",
+        min_count=5,        # default 5
+        max_count=None,     # default: half the genome count
+    )
+    # outputs are written to results/ (same as the CLI); arrays are also returned.
+```
+
+`KMX.build(...)` takes the same options as the CLI — see `help(KMX.build)` for the full signature.
+Defaults match the CLI (`threads=0` = all cores, `max_ram_gb=0` = auto), and the `KMX_*` env knobs apply.
+Pass `write_output=False` to skip the files and only return the arrays (this builds the matrix in RAM,
+so use it only when the matrix fits memory). For advanced use, `KMX.create_csr_matrix(...)` is the
+low-level builder that takes already-parsed manifest inputs.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| `FileNotFoundError: .../gerbil` | The gerbil binary was not compiled. Run `python setup.py install` or follow the manual build instructions above. |
-| `cicc: command not found` during build | CMake found an incomplete CUDA installation. Pass `-DCUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux` to cmake explicitly. |
-| `cmath` errors during gerbil build | CMake picked up system zlib/bzip2 instead of conda's. Pass the `-DZLIB_*` and `-DBZIP2_*` flags shown in the manual build instructions. |
-| gerbil build fails with `cmake_minimum_required` error | CMake 4.x requires VERSION ≥ 3.5. Patch line 1 of gerbil's `CMakeLists.txt`: `sed -i '1s/.*/cmake_minimum_required(VERSION 3.5)/' CMakeLists.txt` |
-| gerbil compiles but **no GPU** (CPU only) | CUDA was not found during cmake. Confirm `$CONDA_PREFIX/nvvm/bin/cicc` exists and pass `-DCUDA_TOOLKIT_ROOT_DIR=$CONDA_PREFIX/targets/x86_64-linux`. |
-| gerbil fails with CUDA > 12.8.1 | Known issue. CUDA 12.8.1 is the tested and supported version. Higher versions have known incompatibilities with gerbil. |
-| `GLIBC_2.XX not found` | Library mismatch between conda and system. Ensure `KMX-env` is activated before running. |
-| gerbil compilation fails with GCC 14+ | gerbil-DataFrame requires GCC ≤ 13. Use GCC 12.2.0: specify `-DCMAKE_C_COMPILER=$(which x86_64-conda-linux-gnu-gcc)` in cmake. |
-| `GLIBCXX` version errors at runtime | gerbil was compiled with a different GCC than expected. Rebuild inside the activated `KMX-env` conda environment. |
-| `ImportError: cudf` or `ImportError: cupy` | Run `conda activate KMX-env` before launching KMX. |
-| Boost-related build errors | Use exactly Boost 1.77.0. Pass `-DBOOST_ROOT=$CONDA_PREFIX` to cmake if needed. |
-| Insufficient disk space | Free at least 12 GB. Run `conda clean --all -y` to clear cached packages. |
-| Slow performance | Check GPU utilization: `nvidia-smi`. Ensure no other process is saturating GPU memory. |
+| Problem | Fix |
+|---------|-----|
+| `ImportError: cudf` / `cupy` | Activate the env: `conda activate KMX-env` (RAPIDS must be installed). |
+| `pip` fails building **kmcpy** | Ensure compilers + zlib/bzip2 are in the env; see the [KMC-DataFrame](https://github.com/M-Serajian/KMC-DataFrame) repo. |
+| `--max (..) must be ≥ --min` | Raise `--max` or lower `--min`. |
+| `manifest mixes FASTA and FASTQ` | Split into one manifest per format family. |
+| Out-of-memory | KMX auto-adapts, but a very large reference at high `k` may need more RAM/VRAM — give the job more memory, or lower `--max-ram-gb` to spill harder. |
+| Slow | The GPU merge is the throughput ceiling; check `nvidia-smi` for contention. |
 
 ---
+
+## Citation
+
+> **Serajian M.**, *et al.* "KMX: GPU-Accelerated K-mer Matrix Constructor." (in preparation).
 
 ## License
 
-KMX is released under the [MIT License](LICENSE).
-
-Copyright © 2025 Mohammadali (Ali) Serajian
-
----
-
-## Contact
-
-For questions or support, contact **ma.serajian@gmail.com** or open an issue on [GitHub](https://github.com/M-Serajian/KMX).
+MIT — © 2025 Mohammadali (Ali) Serajian.
+Questions: **ma.serajian@gmail.com** or open an [issue](https://github.com/M-Serajian/KMX/issues).

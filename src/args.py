@@ -191,14 +191,17 @@ def parse_arguments():
 
     parser.add_argument(
         "--max-ram-gb", dest="max_ram_gb", type=float, default=0.0,
-        help=("Cap on CPU-RAM accumulation of per-genome CSR data. When the "
-              "total bytes held in RAM during stage 2 exceed this value, the "
-              "accumulated chunk is flushed to disk under <tmp_dir> and "
-              "reloaded at the final assembly step. 0 = no cap (everything "
-              "stays in RAM, default). Use a small value (e.g. 0.1) to "
-              "force disk-spill paths during testing. The GPU is already "
-              "kept low (~0.5 GB) by the always-on tier-1 spill, so this "
-              "flag manages CPU RAM, not VRAM.")
+        help=("Cap on CPU-RAM accumulation of per-genome CSR data (Tier-2 "
+              "spill threshold). When the total bytes held in RAM during "
+              "stage 2 exceed this value, the accumulated chunk is flushed "
+              "to disk under <tmp_dir> and reloaded at the final assembly "
+              "step. 0 = auto-derive from the RAM free at launch (default). "
+              "Use a small value (e.g. 0.1) to force disk-spill paths during "
+              "testing. Note: this flag only controls the accumulator spill "
+              "threshold; KMC's per-stage RAM targets (stage-1 reference and "
+              "each stage-2 worker) are always auto-sized from available RAM. "
+              "The GPU is kept low (~0.5 GB) by the always-on tier-1 spill, "
+              "so this flag manages CPU RAM, not VRAM.")
     )
 
     parser.add_argument(
