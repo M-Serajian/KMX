@@ -37,6 +37,8 @@ Returns: (data, column, row, kmer_index_df, sparsity).
 """
 
 import contextlib
+import hashlib
+import json
 import os
 import sys
 import time
@@ -50,7 +52,8 @@ import pandas as pd
 
 import kmcpy
 
-from .ram_budget import plan_ram_budget, plan_vram_shards
+from .ram_budget import (plan_ram_budget, plan_vram_shards, plan_gpu_layout,
+                         available_cpus)
 
 # Set KMX_VERBOSE=1 to see KMC's raw per-genome "Stage 1/2: …%" output and the
 # per-file EOF warnings (useful for debugging; very noisy at 1000 genomes).
@@ -614,6 +617,476 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
                 print(msg, flush=True)
 
 
+def _shard_ranges(n, k):
+    """Split ``[0, n)`` into exactly ``k`` contiguous ranges of near-equal size.
+
+    Used to shard the reference across a group's GPUs (one shard per GPU). Sizes
+    differ by at most one row, so the GPUs in a group are balanced.
+    """
+    base, extra = divmod(int(n), int(k))
+    out, lo = [], 0
+    for i in range(int(k)):
+        sz = base + (1 if i < extra else 0)
+        out.append((lo, lo + sz))
+        lo += sz
+    return out
+
+
+def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
+                      in_q, out_q, cpu_merge):
+    """One merge worker pinned to a single GPU.
+
+    Holds one or more reference column-BLOCKS — ``block_ranges`` is a list of
+    ``(lo, hi)`` global-column slices this worker owns — resident on its GPU. For
+    each genome pulled from ``in_q`` it merges the genome against EVERY block it
+    owns and pushes one fragment per block, ``(g_idx, block_lo, col_idx, count)``,
+    to ``out_q``. The collector reassembles a genome's row from its fragments once
+    every block has reported (the completeness gather).
+
+    Used two ways:
+      * data-parallel      — each worker owns the single full reference block and a
+        genome is sent to ONE worker (one fragment per genome).
+      * reference-parallel — the reference is sharded; each worker owns a subset of
+        blocks and a genome is BROADCAST to all workers (B fragments per genome).
+
+    The payload is either a hand-off tuple (resolved by ``_materialize``) or an
+    already-materialized DataFrame — broadcast pre-materializes once in the parent
+    so a spilled hand-off file isn't read-and-deleted by several workers.
+
+    With ``cpu_merge=True`` it runs the exact pandas merge and never imports
+    cupy/cudf, so the whole orchestration is testable on a GPU-less box.
+    """
+    # Keep host thread pools to 1 in this worker (same rationale as the count
+    # workers): avoid a per-core OpenBLAS/OMP pool in every merge process.
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_v, "1")
+
+    if cpu_merge:
+        os.environ["KMX_CPU_MERGE"] = "1"     # force the exact pandas merge path
+        cudf = cp = None
+    else:
+        # Pin THIS worker to its GPU BEFORE importing cupy, so it sees exactly one
+        # device (its own) as cuda:0 — a fresh CUDA context (spawn, not inherited).
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        import cudf
+        import cupy as cp
+
+    # Load only THIS worker's blocks. Read the full reference once, slice out the
+    # owned blocks (tagged with GLOBAL column indices), upload each to the GPU,
+    # then free the full host copy — VRAM holds only the shard, the whole point.
+    full = pd.read_parquet(ref_parquet_path)
+    blocks = []                                # (lo, hi, block_pdf, ref_gdf)
+    for (lo, hi) in block_ranges:
+        bp = full.iloc[lo:hi].copy()
+        bp["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
+        gdf = None if cpu_merge else cudf.DataFrame.from_pandas(bp)
+        blocks.append((lo, hi, bp, gdf))
+    del full
+    _reclaim_memory()
+    oom_state = {"cpu_fallbacks": 0}
+
+    while True:
+        item = in_q.get()
+        if item is None:                      # sentinel → drain done, exit
+            break
+        g_idx, payload, exp = item            # exp = fragments the row needs total
+        try:
+            df_g = payload if isinstance(payload, pd.DataFrame) \
+                else _materialize(payload)
+            for (lo, hi, bp, gdf) in blocks:  # one fragment per owned block
+                idx_np, val_np = _merge_genome_block(
+                    df_g, gdf, bp, key_cols, cudf, cp, oom_state)
+                out_q.put((g_idx, lo, idx_np, val_np, exp))
+            del df_g
+        except Exception as exc:              # surface to collector; never hang
+            out_q.put(("__error__", g_idx, repr(exc)))
+        if not cpu_merge:
+            try:
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        _reclaim_memory()
+    out_q.put(("__done__", gpu_id, oom_state["cpu_fallbacks"]))
+
+
+def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words,
+                              key_cols, kmer_size, blocks, work, sample_ids,
+                              n_genomes, budget, ctx, spill_root, handoff_dir,
+                              spill_bytes, gpu_layout, oom_state, progress,
+                              cpu_merge, t0):
+    """Multi-GPU streaming assembly (input-order rows, no reload).
+
+    Handles both multi-GPU modes off the same machinery:
+      * ``data_parallel``      — reference replicated per GPU, genomes load-balanced
+        across GPUs (one fragment per genome).
+      * ``reference_parallel`` — reference column-blocks sharded across GPUs, each
+        genome BROADCAST to all GPUs; a row is assembled from its B per-shard
+        fragments. A row is released to the writer ONLY once all its fragments
+        have arrived (completeness gather), so a row can never be truncated.
+
+    Pipeline (one-directional, no cross-stage barriers):
+
+        CPU count pool ─▶ in_q(s) ─▶ D GPU workers ─▶ out_q ─▶ collector ─▶ .npy
+                                       (own block(s))          (gather+reorder, input order)
+
+    Rows are written in input order via the reorder buffer, so the on-disk matrix
+    is identical to the single-GPU build. Returns
+    ``(None, None, row_ptr, decoded, sparsity)``.
+    """
+    import queue
+    import shutil
+    import threading
+
+    os.makedirs(out_dir, exist_ok=True)
+    D = gpu_layout.n_gpus
+    grouped = (gpu_layout.mode == "reference_parallel")
+
+    ref_path = os.path.join(spill_root, f"_ref_replica_{out_suffix}.parquet")
+    ref_pdf.to_parquet(ref_path, index=False)
+
+    out_q = ctx.Queue()
+    # Build the worker set as a device mesh. `group_qs[r]` are the per-worker queues
+    # of replica group r — a genome is broadcast to all of group r's workers and
+    # gathered from them. Data-parallel/single is the degenerate mesh: one shared
+    # queue, every worker holds the full reference, genomes load-balanced by pull.
+    if grouped:
+        # R×S mesh: each group holds the FULL reference sharded across its own GPUs
+        # (exactly 1 shard / GPU → no OOM). Genomes are data-parallel across groups
+        # (round-robin) and reference-parallel within a group (broadcast + gather).
+        group_qs, specs = [], []
+        for grp in gpu_layout.groups:
+            ranges = _shard_ranges(n_unique, len(grp))   # one shard per GPU in grp
+            qs = []
+            for j, gid in enumerate(grp):
+                q = ctx.Queue(maxsize=3)
+                qs.append(q)
+                specs.append((gid, [ranges[j]], q))      # worker holds exactly 1 shard
+            group_qs.append(qs)
+        in_qs = [q for (_, _, q) in specs]
+    else:
+        shared = ctx.Queue(maxsize=max(4, 3 * D))        # load-balanced pull
+        specs = [(gpu_layout.gpu_ids[d], list(blocks), shared) for d in range(D)]
+        group_qs = None
+        in_qs = [shared]
+
+    workers = []
+    for (gid, block_ranges, q) in specs:
+        p = ctx.Process(target=_gpu_merge_worker,
+                        args=(gid, ref_path, block_ranges, key_cols, q, out_q,
+                              cpu_merge),
+                        daemon=True)
+        p.start()
+        workers.append(p)
+
+    # ── Streaming in-order writer (same policy as the single-GPU path) ────────
+    col_fp = _npy_open_stream(os.path.join(out_dir, f"column_{out_suffix}.npy"),
+                              np.uint32)
+    val_fp = _npy_open_stream(os.path.join(out_dir, f"data_{out_suffix}.npy"),
+                              np.float32)
+    sizes = np.zeros(n_genomes, dtype=np.int64)
+    buf = {}            # g_idx -> (idx_np, val_np), full row waiting in RAM
+    buf_spill = {}      # g_idx -> path, parked on disk (overflow)
+    gather = {}         # g_idx -> [(block_lo, idx_np, val_np), …] partial fragments
+    buf_cap = spill_bytes if spill_bytes > 0 else (1 << 30)
+    state = {"next_write": 0, "total_nnz": 0, "written_since_sync": 0,
+             "received": 0, "buf_bytes": 0, "error": None}
+
+    def _emit(gi, idx_np, val_np):
+        sz = int(idx_np.size)
+        if sz:
+            col_fp.write(memoryview(np.ascontiguousarray(idx_np, dtype=np.uint32)))
+            val_fp.write(memoryview(np.ascontiguousarray(val_np, dtype=np.float32)))
+            sizes[gi] = sz
+            state["total_nnz"] += sz
+            state["written_since_sync"] += sz * 8
+
+    def _drain():
+        nw = state["next_write"]
+        while nw < n_genomes and (nw in buf or nw in buf_spill):
+            if nw in buf:
+                idx_np, val_np = buf.pop(nw)
+                state["buf_bytes"] -= (idx_np.nbytes + val_np.nbytes)
+            else:
+                idx_np, val_np = _buf_load_one(buf_spill.pop(nw))
+            _emit(nw, idx_np, val_np)
+            nw += 1
+        state["next_write"] = nw
+
+    def _row_ready(g_idx, idx_full, val_full):
+        """A genome's full row is assembled → buffer it for in-order writing."""
+        buf[g_idx] = (idx_full, val_full)
+        state["buf_bytes"] += idx_full.nbytes + val_full.nbytes
+        _drain()
+        while state["buf_bytes"] > buf_cap and buf:        # park farthest genomes
+            gmax = max(buf)
+            i2, v2 = buf.pop(gmax)
+            state["buf_bytes"] -= (i2.nbytes + v2.nbytes)
+            buf_spill[gmax] = _buf_spill_one(spill_root, gmax, i2, v2)
+        state["received"] += 1
+        progress.update()
+        if state["written_since_sync"] >= (1 << 30):       # bound page cache
+            for _fp in (col_fp, val_fp):
+                _fp.flush()
+                try:
+                    os.fsync(_fp.fileno())
+                    os.posix_fadvise(_fp.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                except Exception:
+                    pass
+            state["written_since_sync"] = 0
+
+    def _ingest(g_idx, block_lo, idx_np, val_np, exp):
+        """Gather a genome's per-shard fragments; release the row only when ALL
+        ``exp`` shards (its group's size) have reported — never write a partial row.
+        ``exp`` rides on each fragment, so no shared state across threads."""
+        lst = gather.get(g_idx)
+        if lst is None:
+            lst = []
+            gather[g_idx] = lst
+        lst.append((block_lo, idx_np, val_np))
+        if len(lst) >= exp:                    # completeness: every shard in
+            del gather[g_idx]
+            if len(lst) == 1:
+                idx_full, val_full = lst[0][1], lst[0][2]
+            else:                              # stitch shards in column order
+                lst.sort(key=lambda t: t[0])
+                idx_full = np.concatenate([t[1] for t in lst])
+                val_full = np.concatenate([t[2] for t in lst])
+            _row_ready(g_idx, idx_full, val_full)
+
+    def _collect():
+        """Drain fragments; gather + stream rows to disk in input order."""
+        try:
+            while state["received"] < n_genomes:
+                try:
+                    item = out_q.get(timeout=10.0)
+                except queue.Empty:
+                    if not any(p.is_alive() for p in workers):
+                        state["error"] = RuntimeError(
+                            f"GPU merge workers exited with "
+                            f"{n_genomes - state['received']} row(s) unmerged")
+                        return
+                    continue
+                tag = item[0]
+                if tag == "__error__":
+                    state["error"] = RuntimeError(
+                        f"GPU merge worker failed on genome "
+                        f"{sample_ids[item[1]]!r}: {item[2]}")
+                    return
+                if tag == "__done__":
+                    continue
+                g_idx, block_lo, idx_np, val_np, exp = item
+                _ingest(g_idx, block_lo, idx_np, val_np, exp)
+        except Exception as exc:               # noqa: BLE001
+            state["error"] = exc
+
+    collector = threading.Thread(target=_collect, daemon=True)
+    collector.start()
+
+    def _put(q, item):                         # backpressure put + liveness check
+        while True:
+            if state["error"] is not None:
+                return
+            try:
+                q.put(item, timeout=5.0)
+                return
+            except queue.Full:
+                if not any(p.is_alive() for p in workers):
+                    state["error"] = RuntimeError(
+                        "all GPU merge workers exited before the run finished")
+                    return
+
+    # ── Dispatch: drive the count pool, feed completed genomes to the GPUs ────
+    if grouped:
+        R = len(group_qs)
+        rr = 0
+        for g_idx, res in _completed_genomes(work, range(n_genomes),
+                                             budget.n_workers, ctx, sample_ids,
+                                             progress=progress):
+            if state["error"] is not None:
+                break
+            grp_qs = group_qs[rr % R]          # round-robin genome → replica group
+            rr += 1
+            # Materialize ONCE, then broadcast a copy to that group's workers (a
+            # spilled hand-off file isn't read+deleted by several workers).
+            df_g = _materialize(res)
+            exp = len(grp_qs)                  # this row needs `exp` shard fragments
+            for q in grp_qs:
+                _put(q, (g_idx, df_g, exp))
+            del df_g
+    else:
+        for g_idx, res in _completed_genomes(work, range(n_genomes),
+                                             budget.n_workers, ctx, sample_ids,
+                                             progress=progress):
+            if state["error"] is not None:
+                break
+            _put(in_qs[0], (g_idx, res, 1))    # shared queue, 1 fragment per genome
+
+    for q in in_qs:                            # one stop sentinel per worker…
+        try:
+            q.put(None, timeout=30)
+        except queue.Full:
+            pass
+    if not grouped:                            # …the shared queue feeds D workers
+        for _ in range(D - 1):
+            try:
+                in_qs[0].put(None, timeout=30)
+            except queue.Full:
+                pass
+
+    collector.join()
+    for p in workers:
+        p.join(timeout=60)
+        if p.is_alive():
+            p.terminate()
+
+    try:
+        os.remove(ref_path)
+    except OSError:
+        pass
+    shutil.rmtree(handoff_dir, ignore_errors=True)
+
+    if state["error"] is not None:
+        try:
+            _npy_finalize_stream(col_fp, np.uint32, state["total_nnz"])
+            _npy_finalize_stream(val_fp, np.float32, state["total_nnz"])
+        except Exception:
+            pass
+        raise state["error"]
+
+    _drain()
+    if state["next_write"] != n_genomes:
+        raise RuntimeError(
+            f"[stage 2] multi-GPU streaming wrote {state['next_write']} of "
+            f"{n_genomes} rows; a genome never completed")
+    if gather:
+        raise RuntimeError(
+            f"[stage 2] {len(gather)} genome(s) never received all of their "
+            f"reference-shard fragment(s) — incomplete row(s), aborting")
+
+    _npy_finalize_stream(col_fp, np.uint32, state["total_nnz"])
+    _npy_finalize_stream(val_fp, np.float32, state["total_nnz"])
+    progress.close()
+
+    total_nnz = state["total_nnz"]
+    row_ptr = np.empty(n_genomes + 1, dtype=np.int64)
+    row_ptr[0] = 0
+    np.cumsum(sizes, out=row_ptr[1:])
+    sparsity = (100.0 * (1.0 - total_nnz / float(n_genomes * n_unique))
+                if n_unique else 100.0)
+    _mode = (f"{D}× GPU reference-parallel ({len(gpu_layout.groups)} group(s) × "
+             f"~{gpu_layout.n_blocks} shards)" if grouped
+             else f"{D}× GPU data-parallel")
+    print(f"      → {total_nnz:,} nonzeros · {sparsity:.1f}% sparse  "
+          f"({time.time()-t0:.1f}s · {_mode}, streamed, input order)", flush=True)
+    print("[3/3] decoding k-mers …", flush=True)
+    with _quiet_kmc():
+        decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
+    decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
+    decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
+    return (None, None, row_ptr, decoded, sparsity)
+
+
+# ── Reference set: build (stage 1) + on-disk cache ──────────────────────────
+# The reference is the COLUMN space: the global set of unique k-mers, stored as
+# KMC's packed 2-bit keys (columns kmer_0..kmer_{n_words-1}, uint64 — 32 two-bit
+# bases per word). Stage 2 merges genomes against exactly these columns, so the
+# cached form needs no decoding. Building it (stage 1) reads the whole dataset
+# once and uses NO GPU, so it can run on a CPU node and be reused.
+_REFERENCE_PARQUET = "reference.parquet"
+_REFERENCE_META    = "reference_meta.json"
+_REFERENCE_FORMAT  = "kmx2-reference-v1"
+
+
+def _count_reference(flat_files, input_fmt, kmer_size, tmp_dir, min_val, max_val,
+                     canonical, n_cpus, stage1_gb):
+    """Stage 1: build the global packed-2bit k-mer reference set. CPU only.
+
+    Returns ``ref_pdf`` — columns ``kmer_0..kmer_{n_words-1}`` of packed uint64
+    keys (KMC's 2-bit-per-base encoding), pre-filtered by ``min_val``/``max_val``
+    at the C++ layer, no counts (``drop_count``). Never imports cupy/cudf.
+    """
+    with _quiet_kmc():
+        ref_pdf = kmcpy.count_kmers(
+            flat_files, tmp_dir=tmp_dir, k=kmer_size, input_fmt=input_fmt,
+            threads=n_cpus, max_ram_gb=int(stage1_gb), canonical=canonical,
+            min_count=min_val, max_count=max_val, decoded=False, drop_count=True)
+    return ref_pdf
+
+
+def _files_signature(flat_files) -> str:
+    """Order-independent signature of the input file set (basename + size).
+
+    Used for strict cache validation: a cached reference is only valid for the
+    exact files it was built from. Detects added/removed/resized inputs cheaply.
+    """
+    parts = []
+    for f in sorted(flat_files):
+        try:
+            sz = os.path.getsize(f)
+        except OSError:
+            sz = -1
+        parts.append(f"{os.path.basename(f)}:{sz}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def save_reference(reference_dir, ref_pdf, kmer_size, min_val, max_val,
+                   canonical, flat_files) -> str:
+    """Write the packed-2bit reference + metadata sidecar to ``reference_dir``."""
+    os.makedirs(reference_dir, exist_ok=True)
+    ref_pdf.to_parquet(os.path.join(reference_dir, _REFERENCE_PARQUET), index=False)
+    meta = {
+        "format":          _REFERENCE_FORMAT,
+        "encoding":        "packed-2bit-uint64",   # KMC 2-bit keys, mergeable by stage 2
+        "kmer_size":       int(kmer_size),
+        "min_count":       int(min_val),
+        "max_count":       int(max_val),
+        "canonical":       bool(canonical),
+        "n_unique":        int(len(ref_pdf)),
+        "n_words":         int(sum(1 for c in ref_pdf.columns if c.startswith("kmer_"))),
+        "key_cols":        [c for c in ref_pdf.columns if c.startswith("kmer_")],
+        "n_files":         int(len(flat_files)),
+        "files_signature": _files_signature(flat_files),
+    }
+    with open(os.path.join(reference_dir, _REFERENCE_META), "w") as fh:
+        json.dump(meta, fh, indent=2)
+    return reference_dir
+
+
+def load_reference(reference_dir):
+    """Load a cached reference. Returns ``(ref_pdf, meta_dict)``."""
+    meta_path = os.path.join(reference_dir, _REFERENCE_META)
+    pq_path   = os.path.join(reference_dir, _REFERENCE_PARQUET)
+    if not (os.path.exists(meta_path) and os.path.exists(pq_path)):
+        raise FileNotFoundError(
+            f"no cached reference in {reference_dir!r} (expected "
+            f"{_REFERENCE_PARQUET} + {_REFERENCE_META}). Build one with "
+            f"--build-reference / KMX.build_reference().")
+    with open(meta_path) as fh:
+        meta = json.load(fh)
+    return pd.read_parquet(pq_path), meta
+
+
+def validate_reference(meta, kmer_size, min_val, max_val, canonical, flat_files):
+    """STRICT check that a cached reference matches this run. Raises on any
+    mismatch — a silently-wrong reference would corrupt the whole matrix."""
+    expected = {
+        "kmer_size": int(kmer_size), "min_count": int(min_val),
+        "max_count": int(max_val), "canonical": bool(canonical),
+    }
+    mism = [(k, meta.get(k), v) for k, v in expected.items() if meta.get(k) != v]
+    sig = _files_signature(flat_files)
+    if meta.get("files_signature") != sig:
+        mism.append(("input file set", "(cached set)", "(current set differs)"))
+    if mism:
+        lines = "\n".join(f"    {k}: reference={a!r}  this run={b!r}"
+                          for k, a, b in mism)
+        raise ValueError(
+            "cached reference does not match this run (strict validation):\n"
+            f"{lines}\n"
+            "  Rebuild it with --build-reference, or fix the parameters to match.")
+
+
 def create_csr_matrix(
     sample_ids: List[str],
     files_by_sample: Dict[str, List[str]],
@@ -628,14 +1101,29 @@ def create_csr_matrix(
     max_ram_gb: float = 0.0,
     out_dir: str = "",
     out_suffix: str = "",
+    max_gpus: int = 0,
+    reference_in: str = "",
 ):
     # GPU imports are *here*, not at module top, so spawn'd workers don't pull
-    # cupy/cudf when they re-import this module.
-    import cudf
-    import cupy as cp
+    # cupy/cudf when they re-import this module. When KMX_CPU_MERGE is forced and
+    # no usable GPU is present (CPU-only box / CI), fall back to running the whole
+    # pipeline on the CPU — cudf/cupy stay None and every merge takes the exact
+    # pandas path. With a GPU present this behaves exactly as before.
+    cpu_merge_forced = bool(os.environ.get("KMX_CPU_MERGE"))
+    cudf = cp = None
+    try:
+        import cudf as _cudf
+        import cupy as _cp
+        _cp.cuda.runtime.getDeviceCount()        # probe — raises without a usable GPU
+        cudf, cp = _cudf, _cp
+    except Exception:
+        if not cpu_merge_forced:
+            raise
+        print("  [cpu-merge] no usable GPU detected — running fully on CPU",
+              flush=True)
 
     canonical = not disable_normalization
-    n_cpus    = threads if threads and threads > 0 else (os.cpu_count() or 4)
+    n_cpus    = threads if threads and threads > 0 else available_cpus()
     n_genomes = len(sample_ids)
     n_files   = len(flat_files)
 
@@ -654,29 +1142,32 @@ def create_csr_matrix(
           f"{n_cpus} workers · {input_fmt}", flush=True)
     print(f"  {budget.describe()}", flush=True)
 
-    # ── Stage 1: global reference k-mer set ──────────────────────────────────
+    # ── Stage 1: global reference k-mer set (build, or load a cached one) ─────
     t0 = time.time()
-    print(f"[1/3] building the global k-mer set from {n_files:,} file(s) …",
-          flush=True)
-    with _quiet_kmc():
-        ref_pdf = kmcpy.count_kmers(
-            flat_files,
-            tmp_dir=tmp_dir,
-            k=kmer_size,
-            input_fmt=input_fmt,
-            threads=n_cpus,
-            max_ram_gb=int(budget.stage1_gb),  # KMC pybind11 binding requires int
-            canonical=canonical,
-            min_count=min_val,
-            max_count=max_val,
-            decoded=False,
-            drop_count=True,
-        )
-    n_unique = len(ref_pdf)
+    if reference_in:
+        # Load the packed-2bit reference from disk and skip stage 1 entirely.
+        # STRICT validation: the cache must match this run's k/min/max/canonical
+        # and input file set, else we refuse (a wrong reference would corrupt the
+        # matrix silently). The reference is already in the exact form stage 2
+        # merges against, so no rebuild/decode is needed here.
+        print(f"[1/3] loading cached reference from {reference_in} …", flush=True)
+        ref_pdf, _ref_meta = load_reference(reference_in)
+        validate_reference(_ref_meta, kmer_size, min_val, max_val, canonical,
+                           flat_files)
+        n_unique = len(ref_pdf)
+        print(f"      → {n_unique:,} unique k-mers  (loaded, stage 1 skipped · "
+              f"{time.time()-t0:.1f}s)", flush=True)
+    else:
+        print(f"[1/3] building the global k-mer set from {n_files:,} file(s) …",
+              flush=True)
+        ref_pdf = _count_reference(flat_files, input_fmt, kmer_size, tmp_dir,
+                                   min_val, max_val, canonical, n_cpus,
+                                   budget.stage1_gb)
+        n_unique = len(ref_pdf)
+        print(f"      → {n_unique:,} unique k-mers  ({time.time()-t0:.1f}s)",
+              flush=True)
     n_words  = sum(1 for c in ref_pdf.columns if c.startswith("kmer_"))
     key_cols = [f"kmer_{i}" for i in range(n_words)]
-    print(f"      → {n_unique:,} unique k-mers  ({time.time()-t0:.1f}s)",
-          flush=True)
     # Release stage 1's freed KMC arenas before stage 2 spawns workers, else its
     # ~stage1_gb residue stacks on top of the workers and OOMs a tight box.
     _rss_pre = _proc_rss_gb()
@@ -700,12 +1191,47 @@ def create_csr_matrix(
     # If it (plus a genome's merge transient) would exceed VRAM, build the
     # matrix in B contiguous column-blocks, re-counting genomes per block.
     # B == 1 is the single-pass path (unchanged). KMX_FORCE_SHARDS overrides B.
-    free_vram = int(cp.cuda.runtime.memGetInfo()[0])
+    free_vram = int(cp.cuda.runtime.memGetInfo()[0]) if cp is not None else 0
+    # Artificial VRAM cap for the *planning* math only (the real merge still probes
+    # actual free VRAM at merge time). Lets you simulate a smaller GPU / leave
+    # headroom so the reference is column-sharded on purpose. KMX_VRAM_BUDGET_GB.
+    _vram_cap = os.environ.get("KMX_VRAM_BUDGET_GB")
+    if _vram_cap:
+        free_vram = max(1, int(float(_vram_cap) * (1024 ** 3)))
+        print(f"  [vram-cap] planning VRAM artificially limited to "
+              f"{float(_vram_cap):.4g} GB", flush=True)
     force = int(os.environ.get("KMX_FORCE_SHARDS", "0") or 0)
     blocks = plan_vram_shards(n_unique, n_words,
                               _max_genome_bytes(files_by_sample), free_vram,
                               force=force)
     B = len(blocks)
+
+    # ── Plan the multi-GPU layout from the block count B ─────────────────────
+    # B == 1 (reference fits one GPU) + >1 GPU → data-parallel (replicate ref,
+    # split genomes). B > 1 (reference too large) + >1 GPU → reference-parallel
+    # (shard the B blocks across GPUs, broadcast genomes). Otherwise single-GPU.
+    # Rows are emitted in input order in every mode. KMX_FORCE_GPUS/KMX_MAX_GPUS
+    # (and KMX_FORCE_SHARDS, via B) override.
+    try:
+        n_visible = int(cp.cuda.runtime.getDeviceCount()) if cp is not None else 0
+    except Exception:
+        n_visible = 0
+    _vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_ids = ([s for s in _vis.split(",") if s != ""] if _vis
+                   else [str(i) for i in range(max(n_visible, 1))])
+    _max_gpus = max_gpus if max_gpus and max_gpus > 0 else \
+        int(os.environ.get("KMX_MAX_GPUS", "4") or 4)
+    gpu_layout = plan_gpu_layout(
+        n_visible, B, n_genomes,
+        ram_available_gb=(budget.detected_gb or 0.0),
+        ref_bytes=n_unique * (8 * n_words + 4),
+        visible_ids=visible_ids, max_gpus=_max_gpus, min_count=min_val)
+    print(f"  {gpu_layout.describe()}", flush=True)
+    if gpu_layout.warning:
+        # Surface the D < S_min resource shortfall loudly and early (before the
+        # long stage-2 work), with the concrete fix, so the user can cancel and
+        # re-request more GPUs if the slowdown isn't acceptable.
+        print(f"  ⚠ WARNING: {gpu_layout.warning}", flush=True)
 
     # ── Stage 2: per-genome counts in parallel (each CPU = one genome) ───────
     #   * One job per genome; KMC merges a genome's own files internally.
@@ -752,14 +1278,23 @@ def create_csr_matrix(
 
     # Smart CPU distribution: the worker COUNT is memory-bound (few workers for big
     # genomes), which would otherwise leave most CPUs idle during stage 2. Hand the
-    # leftover cores to each worker as KMC threads so all n_cpus stay busy at the
+    # leftover cores to each worker as KMC threads so all cores stay busy at the
     # SAME RAM (KMC's memory is bounded by max_ram_gb + the genome's table, which is
     # thread-independent; threads only add parallelism). KMX_KMC_THREADS overrides.
+    #
+    # Multi-GPU: each GPU worker is a host process doing cuDF.from_pandas + H2D/D2H
+    # copies (~1 core), plus the dispatch/collect coordinator (~1 core). Reserve
+    # D+1 cores for those FIRST, then split the rest among count workers — else the
+    # count pool oversubscribes the cores, the GPU feeders starve, and the GPUs idle
+    # waiting on host-side prep. Single-GPU keeps all cores for counting (the merge
+    # runs in the main process there).
+    _gpu_reserve = (gpu_layout.n_gpus + 1) if gpu_layout.n_gpus > 1 else 0
+    _count_cores = max(budget.n_workers, n_cpus - _gpu_reserve)
     _env_thr = os.environ.get("KMX_KMC_THREADS")
     if _env_thr:
         kmc_threads = max(1, int(_env_thr))
     else:
-        kmc_threads = max(1, n_cpus // max(1, budget.n_workers))
+        kmc_threads = max(1, _count_cores // max(1, budget.n_workers))
     print(f"[2/3] CPU split: {budget.n_workers} workers x {kmc_threads} KMC thread(s) "
           f"= {budget.n_workers * kmc_threads}/{n_cpus} cores", flush=True)
 
@@ -801,12 +1336,28 @@ def create_csr_matrix(
     # Tier-2 chunk spill, the final reload, and the scatter: the matrix is
     # written once, sequentially, so peak memory is independent of its size and
     # row i always corresponds to genome G_i. (B > 1 keeps the scatter path.)
+    # Multi-GPU: data-parallel (B==1, replicate ref + split genomes) OR
+    # reference-parallel (B>1, shard the blocks across GPUs + broadcast genomes).
+    # Both stream rows in input order — same on-disk result as the single-GPU
+    # paths below. The reference-parallel branch also replaces the slow B>1
+    # single-GPU loop (which re-counts genomes per block).
+    if (gpu_layout.mode in ("data_parallel", "reference_parallel")
+            and out_dir and out_suffix):
+        return _build_streaming_multigpu(
+            out_dir=out_dir, out_suffix=out_suffix, ref_pdf=ref_pdf,
+            n_unique=n_unique, n_words=n_words, key_cols=key_cols,
+            kmer_size=kmer_size, blocks=blocks, work=work, sample_ids=sample_ids,
+            n_genomes=n_genomes, budget=budget, ctx=ctx, spill_root=spill_root,
+            handoff_dir=handoff_dir, spill_bytes=spill_bytes,
+            gpu_layout=gpu_layout, oom_state=oom_state, progress=progress,
+            cpu_merge=cpu_merge_forced, t0=t0)
+
     if B == 1 and out_dir and out_suffix:
         os.makedirs(out_dir, exist_ok=True)
         lo, hi = blocks[0]
         block_pdf = ref_pdf.iloc[lo:hi].copy()
         block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
-        ref_gdf_b = cudf.DataFrame.from_pandas(block_pdf)
+        ref_gdf_b = None if cudf is None else cudf.DataFrame.from_pandas(block_pdf)
 
         col_fp = _npy_open_stream(os.path.join(out_dir, f"column_{out_suffix}.npy"),
                                   np.uint32)
@@ -888,7 +1439,8 @@ def create_csr_matrix(
                 f"[stage 2] streaming assembly wrote {next_write} of "
                 f"{n_genomes} rows; a genome never completed")
         del ref_gdf_b, block_pdf
-        cp.get_default_memory_pool().free_all_blocks()
+        if cp is not None:
+            cp.get_default_memory_pool().free_all_blocks()
         progress.close()
         import shutil
         shutil.rmtree(handoff_dir, ignore_errors=True)
@@ -918,7 +1470,7 @@ def create_csr_matrix(
         # GLOBAL column index (lo..hi). Keep the host copy for the OOM fallback.
         block_pdf = ref_pdf.iloc[lo:hi].copy()
         block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
-        ref_gdf_b = cudf.DataFrame.from_pandas(block_pdf)
+        ref_gdf_b = None if cudf is None else cudf.DataFrame.from_pandas(block_pdf)
 
         # Watchdog-driven counting: the generator yields each genome's hand-off
         # as workers finish, resubmitting any genome whose worker deadlocks.
@@ -962,7 +1514,8 @@ def create_csr_matrix(
                               f"workers={_kids:.1f} GB  total={_self + _kids:.1f} GB")
 
         del ref_gdf_b, block_pdf
-        cp.get_default_memory_pool().free_all_blocks()
+        if cp is not None:
+            cp.get_default_memory_pool().free_all_blocks()
 
     progress.close()
     # Remove any orphaned hand-off files (a watchdog kill can leave a partial

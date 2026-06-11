@@ -205,11 +205,43 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "-o", "--output", type=check_output_directory, required=True,
-        help="Path to the output directory where results will be stored (required)."
+        "--max-gpus", dest="max_gpus", type=int, default=0,
+        help=("Maximum number of GPUs to use for the per-genome merge. When more "
+              "than one GPU is available and the reference fits a single GPU, the "
+              "merge runs data-parallel across GPUs (each holds a full reference "
+              "replica and merges a share of the genomes); output rows stay in "
+              "input order. 0 = auto (env KMX_MAX_GPUS, else up to 4).")
+    )
+
+    parser.add_argument(
+        "-o", "--output", type=check_output_directory, required=False, default=None,
+        help=("Path to the output directory where results will be stored. Required "
+              "for a normal build; not needed with --build-reference.")
+    )
+
+    parser.add_argument(
+        "--reference", dest="reference", type=str, default="",
+        help=("Cached reference directory. With --build-reference, the reference is "
+              "built and written here (packed 2-bit), then KMX stops. Without it, the "
+              "reference is loaded from here and stage 1 is SKIPPED — strictly "
+              "validated against k / --min / --max / normalization and the input "
+              "file set (any mismatch is a hard error).")
+    )
+
+    parser.add_argument(
+        "--build-reference", dest="build_reference", action="store_true",
+        help=("Build ONLY the global k-mer reference set and cache it to "
+              "--reference (no GPU used), then stop. Run this on a CPU node; a later "
+              "run with --reference <dir> reuses it and skips stage 1.")
     )
 
     args = parser.parse_args()
+
+    # Mode-dependent requirements.
+    if args.build_reference and not args.reference:
+        parser.error("--build-reference requires --reference <dir> (where to write it).")
+    if not args.build_reference and not args.output:
+        parser.error("-o/--output is required (omit it only with --build-reference).")
 
     # Normalize genome list path early
     args.genome_list = os.path.abspath(os.path.expanduser(args.genome_list))

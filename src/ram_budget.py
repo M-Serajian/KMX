@@ -24,7 +24,7 @@ hard allocation.
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 # Tunables (GB / fractions). Conservative on purpose — KMC degrades
@@ -193,6 +193,10 @@ _VRAM_TRANSIENT_MULT = 3            # genome df + join hash table + output + scr
 _VRAM_TRANSIENT_FLOOR = 1 << 30     # never reserve less than 1 GiB for the transient
 _VRAM_BLOCK_FLOOR    = 64 << 20     # a block must be allowed at least 64 MiB
 
+# Multi-GPU (data-parallel) planning. Each data-parallel worker keeps a HOST copy
+# of the reference for its CPU-merge safety net, so D replicas must fit host RAM.
+_GPU_HOST_FRAC = 0.5                 # host RAM the D reference replicas may use
+
 
 def plan_vram_shards(n_unique: int, n_words: int, max_genome_bytes: int,
                      free_vram_bytes: int, force: int = 0) -> List[Tuple[int, int]]:
@@ -215,12 +219,23 @@ def plan_vram_shards(n_unique: int, n_words: int, max_genome_bytes: int,
     """
     if n_unique <= 0:
         return [(0, 0)]
+    # The VRAM transient/block floors are sized for real GPUs; they can be lowered
+    # via env so an *artificial* small VRAM cap (KMX_VRAM_BUDGET_GB) genuinely
+    # shards even a small reference for testing. Defaults preserve real behavior.
+    transient_floor = _VRAM_TRANSIENT_FLOOR
+    block_floor     = _VRAM_BLOCK_FLOOR
+    _tf = os.environ.get("KMX_VRAM_TRANSIENT_FLOOR_MB")
+    if _tf:
+        transient_floor = float(_tf) * (1 << 20)
+    _bf = os.environ.get("KMX_VRAM_BLOCK_FLOOR_MB")
+    if _bf:
+        block_floor = float(_bf) * (1 << 20)
     bytes_per_row   = 8 * n_words + 4
     R               = n_unique * bytes_per_row
     genome_df_bytes = max_genome_bytes * bytes_per_row          # ~1 distinct kmer / base
-    transient       = max(_VRAM_TRANSIENT_FLOOR, _VRAM_TRANSIENT_MULT * genome_df_bytes)
+    transient       = max(transient_floor, _VRAM_TRANSIENT_MULT * genome_df_bytes)
     usable          = free_vram_bytes * _VRAM_SAFETY_FRAC
-    block_budget    = max(usable - transient, _VRAM_BLOCK_FLOOR)
+    block_budget    = max(usable - transient, block_floor)
 
     if force and force > 0:
         B = int(force)
@@ -230,6 +245,139 @@ def plan_vram_shards(n_unique: int, n_words: int, max_genome_bytes: int,
 
     step = math.ceil(n_unique / B)
     return [(lo, min(lo + step, n_unique)) for lo in range(0, n_unique, step)]
+
+
+# ── Multi-GPU layout planning ────────────────────────────────────────────────
+
+@dataclass
+class GpuLayout:
+    """Resolved plan for spreading the per-genome merge across GPUs.
+
+    Models a 2-D device mesh: ``groups`` is the data-parallel axis (genomes split
+    across replica groups) and the GPUs *within* a group are the shard axis (the
+    reference column-sharded across them). ``single``/``data_parallel`` are the
+    degenerate cases (groups of one GPU); ``reference_parallel`` is the general
+    R×S mesh; ``sharded_single`` is the one-GPU sequential fallback.
+    """
+    mode: str            # "single" | "data_parallel" | "sharded_single" | "reference_parallel"
+    n_gpus: int          # GPUs actually used for merging (D)
+    gpu_ids: List[str]   # CUDA id each merge worker pins (len == n_gpus)
+    n_blocks: int        # S_min: min shards to fit one GPU (1 = fits one GPU)
+    note: str
+    groups: List[List[str]] = field(default_factory=list)  # device mesh (replica → its GPU ids)
+    warning: str = ""    # non-empty = surfaced loudly (e.g. D < S_min waves)
+
+    def describe(self) -> str:
+        base = (f"GPU plan: {self.mode} · {self.n_gpus} GPU(s) "
+                f"[{','.join(self.gpu_ids)}] · {self.note}")
+        if self.mode == "reference_parallel" and self.groups:
+            base += "  · groups=" + "+".join(str(len(g)) for g in self.groups)
+        return base
+
+
+def _even_groups(ids: List[str], R: int) -> List[List[str]]:
+    """Split ``ids`` into ``R`` contiguous groups whose sizes differ by ≤1.
+
+    e.g. 11 ids into 2 groups → sizes [6, 5]. Each group then shards the
+    reference across its own GPUs, so all GPUs are used with no leftover.
+    """
+    D = len(ids)
+    base, extra = divmod(D, R)
+    sizes = [base + 1] * extra + [base] * (R - extra)
+    out, i = [], 0
+    for s in sizes:
+        out.append(ids[i:i + s])
+        i += s
+    return out
+
+
+def plan_gpu_layout(n_visible: int, n_blocks: int, n_genomes: int,
+                    ram_available_gb: float = 0.0, ref_bytes: int = 0,
+                    visible_ids: Optional[List[str]] = None,
+                    max_gpus: int = 4, min_count: int = 0) -> GpuLayout:
+    """Choose how to spread the per-genome merge across the available GPUs.
+
+    ``n_blocks`` is ``S_min`` from :func:`plan_vram_shards`: the minimum shards so
+    each fits one GPU's VRAM (1 = the reference fits one GPU). With ``D`` GPUs:
+
+      * ``S_min==1``, 1 GPU  → ``single``.
+      * ``S_min==1``, >1 GPU → ``data_parallel``: replicate the reference per GPU,
+        split the genome stream across them (groups of one GPU each).
+      * ``S_min>1``, ``D ≥ S_min`` → ``reference_parallel`` as an **R×S mesh**:
+        ``R = D // S_min`` replica groups (genomes data-parallel across them), each
+        group holding the full reference sharded across its GPUs (reference-parallel
+        within). GPUs split evenly (e.g. D=11,S_min=4 → groups of 6+5), so all are
+        used; each group shards to its own size. Counted once.
+      * ``S_min>1``, ``D < S_min`` → the reference exceeds *all* GPU VRAM combined →
+        a loud **warning** + the safe single-GPU sequential ``sharded_single``
+        fallback (multi-GPU "waves" not yet built).
+
+    Rows come out in input order in every mode, so the matrix is identical to the
+    single-GPU build. ``KMX_FORCE_GPUS`` / ``KMX_FORCE_SHARDS`` / ``KMX_CPU_MERGE``
+    force the regimes for testing.
+    """
+    S_min = max(1, int(n_blocks))
+    fits  = (S_min <= 1)
+    cap   = max(1, int(max_gpus))
+    forced = int(os.environ.get("KMX_FORCE_GPUS", "0") or 0)
+    if forced > 0:
+        n_gpus = max(1, min(forced, int(n_genomes)))
+    else:
+        n_gpus = max(1, min(int(n_visible), cap, int(n_genomes)))
+
+    if visible_ids is None or len(visible_ids) < n_gpus:
+        visible_ids = [str(i) for i in range(max(n_gpus, 1))]
+    ids = list(visible_ids[:n_gpus])
+
+    if n_gpus <= 1:
+        if fits:
+            return GpuLayout("single", 1, ids[:1], 1, "single GPU",
+                             groups=[ids[:1]])
+        return GpuLayout("sharded_single", 1, ids[:1], S_min,
+                         f"reference in {S_min} column-blocks → single-GPU sequential")
+
+    if fits:
+        # Data-parallel: replicate reference, split genomes. Cap D by host RAM
+        # (each worker keeps a host copy of the reference for its CPU fallback).
+        D = n_gpus
+        if not forced and ram_available_gb > 0 and ref_bytes > 0:
+            ref_host_gb = ref_bytes / (1024 ** 3)
+            if ref_host_gb > 0:
+                D = min(D, max(1, int(_GPU_HOST_FRAC * ram_available_gb / ref_host_gb)))
+        D = max(1, min(D, int(n_genomes)))
+        if D <= 1:
+            return GpuLayout("single", 1, ids[:1], 1,
+                             "single GPU (data-parallel capped by host RAM)",
+                             groups=[ids[:1]])
+        return GpuLayout("data_parallel", D, ids[:D], 1,
+                         f"{D}-way data-parallel (reference replicated per GPU)",
+                         groups=[[g] for g in ids[:D]])
+
+    # Reference exceeds one GPU (S_min > 1).
+    if n_gpus < S_min:
+        # Doesn't fit even all GPUs combined → would need W waves. Not yet built:
+        # warn loudly (with the fix) and fall back to the correct single-GPU path.
+        W = -(-S_min // n_gpus)   # ceil
+        cur = f" (currently {min_count})" if min_count else ""
+        warn = (f"reference needs {S_min} GPU-fulls of VRAM but only {n_gpus} GPU(s) "
+                f"are allocated — it does not fit even across all of them. THIS IS THE "
+                f"LEAST EFFICIENT CASE: KMX falls back to a single-GPU sequential build "
+                f"({W} passes, the other GPUs idle). RECOMMENDED FIX: raise --min{cur} "
+                f"to drop the rare/error k-mer tail and shrink the reference so it fits "
+                f"the GPUs — this is usually the cheapest lever (note: it changes which "
+                f"k-mers are kept, so it alters the matrix, not just the speed). "
+                f"Otherwise, allocate at least {S_min} GPUs (or higher-VRAM cards).")
+        return GpuLayout("sharded_single", 1, ids[:1], S_min,
+                         f"reference in {S_min} column-blocks → single-GPU sequential "
+                         f"(D={n_gpus} < S_min={S_min})", warning=warn)
+
+    # D ≥ S_min → grouped reference-parallel (R × S mesh). Maximize replica groups.
+    R = n_gpus // S_min
+    groups = _even_groups(ids, R)
+    return GpuLayout("reference_parallel", n_gpus, ids, S_min,
+                     f"R={R} replica group(s) × ~{S_min} shards "
+                     f"(reference too large for one GPU; genomes split across groups)",
+                     groups=groups)
 
 
 def available_ram_gb() -> Optional[float]:
@@ -246,6 +394,55 @@ def available_ram_gb() -> Optional[float]:
                          _slurm_mem_gb())
              if v is not None and v > 0]
     return min(cands) if cands else None
+
+
+def available_cpus() -> int:
+    """Best-effort count of CPU cores THIS process may actually use.
+
+    ``os.cpu_count()`` reports the whole NODE, which over-subscribes a job that
+    was granted only a fraction of it (e.g. a 6-core SLURM allocation on a 96-core
+    node) — inflating the worker/thread split and the multi-GPU core reservation.
+    Take the MINIMUM of every signal that reflects this job's real grant:
+
+      * ``SLURM_CPUS_PER_TASK`` / ``SLURM_CPUS_ON_NODE`` — the scheduler's grant.
+      * ``os.sched_getaffinity`` — honours cpuset cgroups and ``taskset`` pinning.
+      * cgroup v2 ``cpu.max`` quota (``quota/period``), resolved to this process's
+        own cgroup then the mount root.
+      * ``os.cpu_count()`` — node total, the floor of last resort.
+    """
+    cands = []
+    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        v = os.environ.get(var)
+        if v:
+            m = re.match(r"\d+", str(v))   # e.g. "6" or "6(x2)"
+            if m:
+                cands.append(int(m.group()))
+    try:
+        cands.append(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    # cgroup v2 CPU quota (cpu.max = "<quota> <period>"; "max" = unlimited).
+    path_v2 = None
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+                    path_v2 = parts[2]
+    except Exception:
+        pass
+    base = "/sys/fs/cgroup"
+    for cdir in ([base + path_v2] if path_v2 else []) + [base]:
+        try:
+            with open(os.path.join(cdir, "cpu.max")) as f:
+                q, p = f.read().split()[:2]
+            if q != "max" and int(p) > 0:
+                cands.append(max(1, int(int(q) // int(p))))
+                break
+        except Exception:
+            continue
+    cands.append(os.cpu_count() or 1)
+    return max(1, min(cands))
 
 
 def plan_ram_budget(n_cpus: int, n_genomes: int,

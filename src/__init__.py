@@ -9,6 +9,12 @@ Public API
         -> writes the CSR matrix + metadata to out/, and returns
            (data, column, row, kmer_index_df, sparsity)
 
+    # cache the reference once (CPU only, no GPU), then reuse it (skips stage 1)
+    KMX.build_reference("manifest.csv", kmer_size=21, tmp_dir="/scratch/tmp",
+                        reference_dir="ref/")
+    KMX.build("manifest.csv", kmer_size=21, tmp_dir="/scratch/tmp",
+              output_dir="out/", reference="ref/")
+
     # low-level: if you already have parsed-manifest inputs
     KMX.create_csr_matrix(...)
 
@@ -22,7 +28,7 @@ See help(KMX.build) for all arguments.
 
 __version__ = "2.0.0.dev0"
 
-from .cli import build                              # high-level entry point
+from .cli import build, build_reference             # high-level entry points
 from .create_csr_matrix import create_csr_matrix    # low-level builder
 
-__all__ = ["build", "create_csr_matrix", "__version__"]
+__all__ = ["build", "build_reference", "create_csr_matrix", "__version__"]

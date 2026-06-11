@@ -12,9 +12,11 @@ merges them against the global k-mer set on the GPU ([cuDF](https://github.com/r
 and writes the matrix to disk.
 
 **What makes it scale:** the matrix is built **out-of-core** — genomes are counted in parallel on the CPU,
-streamed through the GPU one at a time, and written to disk **in input order** within an **automatic memory budget**.
+streamed through the GPU, and written to disk **in input order** within an **automatic memory budget**.
 Peak GPU and host memory stay bounded *regardless of dataset size*, so even datasets whose matrix is far larger
-than RAM or VRAM run on a modest box.
+than RAM or VRAM run on a modest box. When several GPUs are available, the per-genome merge runs in parallel
+across them automatically — replicating the reference and splitting the genomes when it fits one GPU, or sharding
+the k-mer columns across GPUs when it doesn't (see [Multiple GPUs](#multiple-gpus)) — and rows still land in input order.
 
 ---
 
@@ -69,7 +71,7 @@ KMX --help
 KMX -l manifest.csv -k 31 -t /scratch/tmp -o results/ --min 5 --max 100
 ```
 
-That's it — KMX sizes CPUs, GPU, and RAM automatically. Outputs land in `results/`.
+That's it — KMX sizes CPUs, GPUs, and RAM automatically. Outputs land in `results/`.
 
 ---
 
@@ -113,17 +115,100 @@ KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
 | `-d`, `--disable-normalization` | no | off | Treat a k-mer and its reverse complement as distinct (default: canonical). |
 | `-T`, `--threads` | no | `0` | CPU threads; `0` = all cores. |
 | `--max-ram-gb` | no | `0` (auto) | Cap on host RAM for the in-memory accumulator before it spills to disk. `0` = auto from the cgroup/SLURM limit. |
+| `--max-gpus` | no | `0` (auto) | Max GPUs for the merge. With >1 GPU and a reference that fits one GPU, the merge runs data-parallel across them. `0` = auto (env `KMX_MAX_GPUS`, else up to 4). |
+| `--reference` | no | — | Cached reference directory. With `--build-reference`, write it here; otherwise load it here and skip stage 1 (strictly validated). See [Caching the reference](#caching-the-reference). |
+| `--build-reference` | no | off | Build **only** the reference set into `--reference` (no GPU), then stop. Run on a CPU node. |
 
 ### Automatic resource budgeting
 
-KMX picks the worker count, threads-per-worker, and spill thresholds **automatically** from the cores, host RAM
-(cgroup/SLURM), and free VRAM it's given. No tuning needed. Three optional env vars override the defaults:
+KMX picks the worker count, threads-per-worker, spill thresholds, **and the multi-GPU layout** automatically from
+the cores, host RAM (cgroup/SLURM), and the GPUs/VRAM it's given (see [Multiple GPUs](#multiple-gpus) for the layout
+rules). Rows always come out in input order. No tuning needed. Optional env vars override the defaults:
 
 | Variable | Effect |
 |----------|--------|
+| `KMX_MAX_GPUS` | Cap on GPUs used for the merge (default: up to 4 / all visible). |
 | `KMX_KMC_THREADS` | KMC threads per worker (default: `cores / workers`). |
 | `KMX_WORKER_SPILL_MB` | Per-genome table size above which a worker spills to disk (`0` = always in RAM). |
 | `KMX_SPILL_DIR` | Where disk-spill files go (default: `<tmp_dir>`). Point at a roomy/fast volume. |
+
+---
+
+## Multiple GPUs
+
+KMX chooses the layout automatically from two numbers: **`S`** = how many shards the reference needs
+(`S = ⌈reference ÷ per-GPU VRAM⌉`, so `S = 1` means it fits one GPU) and **`D`** = the GPUs available. In every
+case rows come out in **input order** and the reference is **counted once**. **The build is most efficient when the
+whole reference fits one GPU (`S = 1`)** — keep it within one GPU's VRAM if you can.
+
+| Scenario | Condition | Mode | What KMX does |
+|----------|-----------|------|---------------|
+| One GPU, reference fits | `D = 1`, `S = 1` | `single` | Builds on the one GPU, streaming rows to disk in input order. |
+| One GPU, reference too big | `D = 1`, `S > 1` | `sharded_single` | Splits the reference into `S` column-blocks and merges them **sequentially** on the one GPU. Correct, slower. |
+| Multi-GPU, reference fits one GPU | `D > 1`, `S = 1` | `data_parallel` | **Each GPU holds a full copy** of the reference; genomes load-balanced across GPUs. **The efficient case** — near-linear with GPU count. |
+| Reference needs exactly all GPUs | `D > 1`, `D = S` | `reference_parallel` (1 group) | Reference **sharded across all `D` GPUs** (one shard each); every genome is broadcast to the shards and reassembled in column order. |
+| More GPUs than shards | `D > 1`, `D > S` | `reference_parallel` (`R = ⌊D/S⌋` groups) | GPUs split into `R` even **replica groups** (e.g. 11 GPUs, `S = 4` → **6 + 5**). Each group holds the full reference sharded across its GPUs; **genomes data-parallel across groups**, reference-parallel within. All GPUs busy + genome parallelism. |
+| Fewer GPUs than shards — **least efficient** | `D > 1`, `D < S` | ⚠ warning → `sharded_single` | Reference exceeds **all** GPUs' VRAM combined — the worst case: it can't be held even across every GPU, so KMX falls back to a **single-GPU sequential** build and the other GPUs sit idle. It **warns** with the fix and continues (still correct). |
+
+**Avoiding the `D < S` case.** This is the configuration to design *out* of. The cheapest lever is usually **raising
+`--min`**: it drops the rare/error k-mer tail (huge for FASTQ), which shrinks the reference and lowers `S` until it
+fits your GPUs — turning the slow single-GPU fallback back into a parallel build. The other option is to allocate
+more / higher-VRAM GPUs (`D ≥ S`). Raising `--min` *changes which k-mers are kept* (a feature-set change, not just
+speed), so choose a threshold you're comfortable with. Use the [capacity table](#how-many-k-mers-fit-on-one-gpu)
+to see how many k-mers each GPU holds, and HLL/ntCard to estimate your reference size before committing.
+
+### How many k-mers fit on one GPU
+
+A resident reference k-mer costs `8·⌈k/32⌉ + 4` bytes (the packed 2-bit key + its column index). For **k ≤ 32**
+that's **12 bytes**, so a GPU holds roughly `VRAM × 0.80 ÷ 12` distinct k-mers — the `0.80` is KMX's default VRAM
+headroom; a ~1 GB per-genome working reserve trims it a little more in practice:
+
+| GPU | VRAM | ~max distinct k-mers (k ≤ 32) |
+|-----|------|-------------------------------|
+| NVIDIA T4    | 16 GB  | ~1.1 billion |
+| NVIDIA L4    | 24 GB  | ~1.7 billion |
+| V100         | 32 GB  | ~2.3 billion |
+| A100         | 40 GB  | ~2.9 billion |
+| L40S         | 48 GB  | ~3.4 billion |
+| A100 / H100  | 80 GB  | ~5.7 billion |
+| H200         | 141 GB | ~10 billion  |
+| B200         | 192 GB | ~14 billion  |
+
+**Longer k shrinks this in steps, not linearly.** The cost `8·⌈k/32⌉ + 4` jumps by 8 bytes every 32 bases, and is
+**flat within a band** — so k = 31 is already in the top (cheapest) band, and *every* k from 1–32 fits the same
+count. To convert the table for longer k, multiply by `12 / (8·⌈k/32⌉ + 4)`:
+
+| k | bytes/k-mer | capacity vs table |
+|---|-------------|-------------------|
+| ≤ 32     | 12 | ×1.00 |
+| 33–64    | 20 | ×0.60 |
+| 65–96    | 28 | ×0.43 |
+| 97–128   | 36 | ×0.33 |
+| 129–136  | 44 | ×0.27 |
+
+So if your reference is just over one GPU at, say, k = 35, dropping to k ≤ 32 alone gives ~1.7× the capacity and may
+let it fit (changing k changes the feature set, though).
+
+---
+
+## Caching the reference
+
+The first stage — building the **global k-mer set** (the matrix columns) — reads the whole dataset once and uses
+**no GPU**. For big inputs (e.g. FASTQ) it's the slow part. You can build it **once on a CPU node**, cache it to
+disk, and reuse it so later runs **skip stage 1** (and don't burn GPU time on it):
+
+```bash
+# 1) Build + cache the reference (CPU node, no GPU). Writes ref/.
+KMX --build-reference -l manifest.csv -k 31 --min 5 --max 10000 -t /scratch/tmp --reference ref/
+
+# 2) Build the matrix, reusing it (GPU node) — stage 1 is skipped.
+KMX -l manifest.csv -k 31 --min 5 --max 10000 -t /scratch/tmp -o results/ --reference ref/
+```
+
+`ref/` holds `reference.parquet` (the **packed 2-bit** KMC keys — exactly what the merge consumes, no decoding)
+plus `reference_meta.json`. The reference is **strictly validated** on load: `-k`, `--min`, `--max`, normalization,
+and the input file set must all match what it was built from, or KMX refuses (a stale reference would silently
+corrupt the matrix). Rebuild with `--build-reference` if any of those change.
 
 ---
 
@@ -176,10 +261,24 @@ if __name__ == "__main__":
 ```
 
 `KMX.build(...)` takes the same options as the CLI — see `help(KMX.build)` for the full signature.
-Defaults match the CLI (`threads=0` = all cores, `max_ram_gb=0` = auto), and the `KMX_*` env knobs apply.
+Defaults match the CLI (`threads=0` = all cores, `max_ram_gb=0` = auto, `max_gpus=0` = auto/all GPUs), and the
+`KMX_*` env knobs apply.
 Pass `write_output=False` to skip the files and only return the arrays (this builds the matrix in RAM,
 so use it only when the matrix fits memory). For advanced use, `KMX.create_csr_matrix(...)` is the
 low-level builder that takes already-parsed manifest inputs.
+
+To cache the reference once (CPU only) and reuse it (see [Caching the reference](#caching-the-reference)):
+
+```python
+import KMX
+KMX.build_reference("manifest.csv", kmer_size=31, tmp_dir="/scratch/tmp",
+                    reference_dir="ref/", min_count=5, max_count=10000)   # no GPU; writes ref/
+
+if __name__ == "__main__":
+    KMX.build("manifest.csv", kmer_size=31, tmp_dir="/scratch/tmp",
+              output_dir="results/", min_count=5, max_count=10000,
+              reference="ref/")          # loads ref/, skips stage 1 (strictly validated)
+```
 
 ---
 
@@ -190,9 +289,10 @@ low-level builder that takes already-parsed manifest inputs.
 | `ImportError: cudf` / `cupy` | Activate the env: `conda activate KMX-env` (RAPIDS must be installed). |
 | `pip` fails building **kmcpy** | Ensure compilers + zlib/bzip2 are in the env; see the [KMC-DataFrame](https://github.com/M-Serajian/KMC-DataFrame) repo. |
 | `--max (..) must be ≥ --min` | Raise `--max` or lower `--min`. |
+| `cached reference does not match this run` | The `--reference` cache was built with different `-k`/`--min`/`--max`/normalization or input files. Rebuild it with `--build-reference`. |
 | `manifest mixes FASTA and FASTQ` | Split into one manifest per format family. |
 | Out-of-memory | KMX auto-adapts, but a very large reference at high `k` may need more RAM/VRAM — give the job more memory, or lower `--max-ram-gb` to spill harder. |
-| Slow | The GPU merge is the throughput ceiling; check `nvidia-smi` for contention. |
+| Slow | The GPU merge is the throughput ceiling — give the job more GPUs (KMX uses them data-parallel automatically), or check `nvidia-smi` for contention. |
 
 ---
 

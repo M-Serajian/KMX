@@ -16,8 +16,9 @@ import threading
 from .args import parse_arguments
 from .create_csr_matrix import create_csr_matrix
 from .manifest import parse_manifest, write_genome_index, ManifestError
-from .ram_budget import plan_ram_budget
-from .create_csr_matrix import estimate_worker_df_gb
+from .ram_budget import plan_ram_budget, available_cpus
+from .create_csr_matrix import (
+    estimate_worker_df_gb, _count_reference, save_reference)
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,75 @@ def write_stats(path: str, text: str) -> None:
         f.write(text)
 
 
+def build_reference(
+    manifest: str,
+    kmer_size: int,
+    tmp_dir: str,
+    reference_dir: str,
+    *,
+    min_count: int = 5,
+    max_count: "int | None" = None,
+    disable_normalization: bool = False,
+    threads: int = 0,
+    max_ram_gb: float = 0.0,
+):
+    """Build ONLY the global k-mer reference set and cache it to disk — no GPU.
+
+    Runs stage 1 (the column space) over every input file and writes the packed
+    **2-bit** reference (``reference.parquet`` — KMC uint64 keys, exactly what
+    stage 2 merges against) plus a ``reference_meta.json`` sidecar to
+    ``reference_dir``, then stops. A later ``build(..., reference=reference_dir)``
+    (or ``KMX -l … --reference reference_dir``) loads it and **skips stage 1**.
+
+    Because stage 1 touches no GPU, run this on a CPU-only node so the (often
+    multi-hour) reference build never sits on the GPU clock, and so it isn't
+    repeated across downstream runs.
+
+    Args:
+        manifest: manifest CSV (``sample_id,file``).
+        kmer_size: k-mer length, 8–136. ``min_count``/``max_count`` are baked into
+            the reference and must match the later ``build`` call (strictly checked).
+        tmp_dir: scratch directory (created if absent).
+        reference_dir: directory to write the cached reference into (created).
+        min_count/max_count: global k-mer count filter (``max_count=None`` → N/2).
+        disable_normalization, threads, max_ram_gb: as in :func:`build`.
+
+    Returns:
+        ``reference_dir``.
+
+    Raises:
+        ManifestError, ValueError (``max_count < min_count``).
+    """
+    os.makedirs(reference_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+    m = parse_manifest(manifest)
+    n_genomes = len(m.sample_ids)
+    if max_count is None:
+        max_count = max(1, n_genomes // 2)
+    if max_count < min_count:
+        raise ValueError(f"max_count ({max_count}) must be >= min_count ({min_count})")
+
+    canonical   = not disable_normalization
+    eff_threads = threads if threads and threads > 0 else available_cpus()
+    budget = plan_ram_budget(
+        eff_threads, n_genomes, max_ram_gb,
+        worker_df_gb=estimate_worker_df_gb(m.files_by_sample, kmer_size))
+    log.info("Building reference (CPU only): %d genome(s), %d file(s), k=%d, "
+             "min=%d, max=%d, canonical=%s", n_genomes, len(m.flat_files),
+             kmer_size, min_count, max_count, canonical)
+
+    t0 = time.time()
+    ref_pdf = _count_reference(m.flat_files, m.input_fmt, kmer_size, tmp_dir,
+                               min_count, max_count, canonical, eff_threads,
+                               budget.stage1_gb)
+    save_reference(reference_dir, ref_pdf, kmer_size, min_count, max_count,
+                   canonical, m.flat_files)
+    log.info("Reference: %d unique k-mers (packed 2-bit) → %s  [%s]",
+             len(ref_pdf), reference_dir,
+             datetime.timedelta(seconds=(time.time() - t0)))
+    return reference_dir
+
+
 def build(
     manifest: str,
     kmer_size: int,
@@ -71,6 +141,8 @@ def build(
     disable_normalization: bool = False,
     threads: int = 0,
     max_ram_gb: float = 0.0,
+    max_gpus: int = 0,
+    reference: str = "",
     write_output: bool = True,
 ):
     """Build a genome × k-mer CSR matrix from a manifest — the same pipeline as the ``KMX`` CLI.
@@ -86,6 +158,14 @@ def build(
         disable_normalization: If True, a k-mer and its reverse complement are distinct features.
         threads: CPU threads; ``0`` = all cores granted to the process.
         max_ram_gb: Host-RAM cap for the accumulator before spilling; ``0`` = auto (cgroup/SLURM).
+        max_gpus: Max GPUs to use for the merge. ``0`` = auto (env ``KMX_MAX_GPUS`` or 4).
+            When >1 GPU is available and the reference fits one GPU, the per-genome
+            merge runs data-parallel across GPUs; rows stay in input order.
+        reference: Path to a cached reference directory (from ``build_reference`` /
+            ``--build-reference``). If set, stage 1 is **skipped** and the packed
+            2-bit reference is loaded from there; it is strictly validated against
+            this run's ``kmer_size``/``min``/``max``/normalization and input files.
+            ``""`` = build the reference inline as usual.
         write_output: If True (default), write ``data``/``column``/``row`` ``.npy``, the k-mer CSV,
             the genome index, and the stats file to ``output_dir`` (CLI behavior). If False, skip
             the files and just return the arrays (note: this builds the matrix in RAM, so only use
@@ -131,7 +211,7 @@ def build(
     log.info("GPU: %s | total=%.2f GB | free=%.2f GB", props["name"].decode("utf-8"),
              props["totalGlobalMem"] / (1024 ** 3), dev.mem_info[0] / (1024 ** 3))
 
-    eff_threads = threads if threads and threads > 0 else (os.cpu_count() or 4)
+    eff_threads = threads if threads and threads > 0 else available_cpus()
     ram_budget = plan_ram_budget(
         eff_threads, n_genomes, max_ram_gb,
         worker_df_gb=estimate_worker_df_gb(m.files_by_sample, kmer_size))
@@ -156,6 +236,8 @@ def build(
             disable_normalization=disable_normalization,
             threads=threads,
             max_ram_gb=max_ram_gb,
+            max_gpus=max_gpus,
+            reference_in=reference,
             out_dir=output_dir if write_output else "",
             out_suffix=suffix if write_output else "",
         )
@@ -207,20 +289,39 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_arguments()
     try:
-        build(
-            manifest=args.genome_list,
-            kmer_size=args.kmer_size,
-            tmp_dir=args.tmp,
-            output_dir=args.output,
-            min_count=args.min,
-            max_count=args.max,
-            disable_normalization=args.disable_normalization,
-            threads=args.threads,
-            max_ram_gb=args.max_ram_gb,
-        )
+        if args.build_reference:
+            # Stage 1 only: build + cache the reference (no GPU), then stop.
+            build_reference(
+                manifest=args.genome_list,
+                kmer_size=args.kmer_size,
+                tmp_dir=args.tmp,
+                reference_dir=args.reference,
+                min_count=args.min,
+                max_count=args.max,
+                disable_normalization=args.disable_normalization,
+                threads=args.threads,
+                max_ram_gb=args.max_ram_gb,
+            )
+        else:
+            build(
+                manifest=args.genome_list,
+                kmer_size=args.kmer_size,
+                tmp_dir=args.tmp,
+                output_dir=args.output,
+                min_count=args.min,
+                max_count=args.max,
+                disable_normalization=args.disable_normalization,
+                threads=args.threads,
+                max_ram_gb=args.max_ram_gb,
+                max_gpus=args.max_gpus,
+                reference=args.reference,
+            )
     except ManifestError as e:
         log.error("Manifest error: %s", e)
         return 3
+    except (ValueError, FileNotFoundError) as e:        # bad params / cache mismatch
+        log.error("%s", e)
+        return 4
     except ImportError as e:
         log.error("RAPIDS cuDF/CuPy import failed — is the RAPIDS env active? (%s)", e)
         return 2
