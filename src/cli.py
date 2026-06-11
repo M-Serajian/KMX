@@ -143,6 +143,7 @@ def build(
     max_ram_gb: float = 0.0,
     max_gpus: int = 0,
     reference: str = "",
+    presence: bool = False,
     write_output: bool = True,
 ):
     """Build a genome × k-mer CSR matrix from a manifest — the same pipeline as the ``KMX`` CLI.
@@ -166,6 +167,10 @@ def build(
             2-bit reference is loaded from there; it is strictly validated against
             this run's ``kmer_size``/``min``/``max``/normalization and input files.
             ``""`` = build the reference inline as usual.
+        presence: If True, store presence/absence (``int8`` 0/1) instead of counts — a
+            0/1 matrix ideal for chi-squared / association tests, 4x smaller than the
+            ``float32`` counts (sum-safe: scipy/numpy/cupy upcast the accumulator to
+            int64). Output files gain a ``_presence`` suffix.
         write_output: If True (default), write ``data``/``column``/``row`` ``.npy``, the k-mer CSV,
             the genome index, and the stats file to ``output_dir`` (CLI behavior). If False, skip
             the files and just return the arrays (note: this builds the matrix in RAM, so only use
@@ -221,7 +226,8 @@ def build(
     monitor.start()
     t0 = time.time()
     d_status = 1 if disable_normalization else 0
-    suffix   = f"k{kmer_size}_min{min_count}_max{max_count}_d{d_status}"
+    suffix   = (f"k{kmer_size}_min{min_count}_max{max_count}_d{d_status}"
+                + ("_presence" if presence else ""))
 
     try:
         data, column, row, unique_kmers, sparsity = create_csr_matrix(
@@ -238,6 +244,7 @@ def build(
             max_ram_gb=max_ram_gb,
             max_gpus=max_gpus,
             reference_in=reference,
+            binarize=presence,
             out_dir=output_dir if write_output else "",
             out_suffix=suffix if write_output else "",
         )
@@ -315,6 +322,7 @@ def main() -> int:
                 max_ram_gb=args.max_ram_gb,
                 max_gpus=args.max_gpus,
                 reference=args.reference,
+                presence=args.presence,
             )
     except ManifestError as e:
         log.error("Manifest error: %s", e)

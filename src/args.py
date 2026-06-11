@@ -175,6 +175,14 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "-p", "--presence", action="store_true",
+        help=("Store presence/absence (int8 0/1) instead of k-mer counts — a 0/1 "
+              "matrix, ideal input for chi-squared / association tests, and 4x "
+              "smaller than float32 counts (sum-safe: scipy/numpy/cupy upcast to "
+              "int64). Output files gain a '_presence' suffix.")
+    )
+
+    parser.add_argument(
         "-d", "--disable-normalization", action="store_true",
         help=("Disable normalization of k-mers. If normalization is disabled, a k-mer and its reverse complement "
               "are considered as different k-mers. If normalization is enabled (default), both k-mer and its reverse "

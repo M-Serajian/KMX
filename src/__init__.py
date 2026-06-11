@@ -30,5 +30,7 @@ __version__ = "2.0.0.dev0"
 
 from .cli import build, build_reference             # high-level entry points
 from .create_csr_matrix import create_csr_matrix    # low-level builder
+from .create_csr_matrix import load_csr             # load output → scipy / cupyx CSR
 
-__all__ = ["build", "build_reference", "create_csr_matrix", "__version__"]
+__all__ = ["build", "build_reference", "create_csr_matrix", "load_csr",
+           "__version__"]

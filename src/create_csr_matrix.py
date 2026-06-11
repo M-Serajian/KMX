@@ -254,7 +254,7 @@ def _spill_chunk(fragments, tmp_dir: str, chunk_no: int) -> str:
     sizes = np.fromiter((idx.size for _, idx, _ in fragments), dtype=np.int64,
                         count=len(fragments))
     big_idx = (np.concatenate([idx for _, idx, _ in fragments]) if fragments
-               else np.empty(0, dtype=np.uint32))
+               else np.empty(0, dtype=np.int32))
     big_val = (np.concatenate([val for _, _, val in fragments]) if fragments
                else np.empty(0, dtype=np.float32))
     path = os.path.join(tmp_dir, f"kmx_csr_chunk_{chunk_no:05d}.npz")
@@ -461,15 +461,39 @@ _MERGE_VRAM_MULT   = 3.0
 _MERGE_VRAM_SAFETY = 0.80     # leave headroom for fragmentation/driver
 
 
-def _cpu_merge_block(df_g, block_pdf, key_cols):
+def _col_index_dtype(n_unique):
+    """Pick the column-index dtype dynamically from the reference size.
+
+    The column index holds values in [0, n_unique). We use SIGNED integers so the
+    arrays load straight into ``scipy.sparse`` and ``cupyx.scipy.sparse`` (RAPIDS)
+    without dtype-conversion copies or errors (both expect int32/int64; unsigned
+    types are not their native index dtype). int32 (≤ 2,147,483,647) covers the
+    vast majority of references compactly; only when the reference genuinely
+    exceeds that do we widen to int64. .npy files self-describe their dtype, so
+    consumers load the right type with no metadata. ``KMX_COL_DTYPE`` forces it
+    (e.g. to test the int64 path).
+    """
+    env = os.environ.get("KMX_COL_DTYPE")
+    if env:
+        return np.dtype(env)
+    return (np.dtype(np.int32) if int(n_unique) <= np.iinfo(np.int32).max
+            else np.dtype(np.int64))
+
+
+def _cpu_merge_block(df_g, block_pdf, key_cols, binarize=False):
     """Exact CPU (pandas) inner join — identical result to the cuDF merge."""
     merged = df_g.merge(block_pdf, on=key_cols, how="inner")  # block_pdf has __col_idx__
-    idx = merged["__col_idx__"].to_numpy().astype(np.uint32)
-    val = merged["count"].to_numpy().astype(np.float32)
+    # Keep the column-index dtype the block was built with (uint32 or uint64) —
+    # block_pdf["__col_idx__"] carries it, so the merge output already has it.
+    idx = merged["__col_idx__"].to_numpy().astype(block_pdf["__col_idx__"].dtype)
+    # binarize → presence/absence (uint8 1s); else the float32 count.
+    val = (np.ones(idx.size, dtype=np.int8) if binarize
+           else merged["count"].to_numpy().astype(np.float32))
     return idx, val
 
 
-def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state):
+def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state,
+                        binarize=False):
     """Merge one genome's counts against one reference column-block.
 
     Returns ``(col_idx_uint32_np, count_float32_np)`` for the k-mers of this
@@ -495,8 +519,11 @@ def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_stat
         try:
             gdf = cudf.DataFrame.from_pandas(df_g)
             merged = gdf.merge(ref_gdf_b, on=key_cols, how="inner")
-            idx = cp.asnumpy(merged["__col_idx__"].values.astype(cp.uint32))
-            val = cp.asnumpy(merged["count"].values.astype(cp.float32))
+            # Preserve the block's column-index dtype (uint32 or uint64).
+            idx = cp.asnumpy(merged["__col_idx__"].values.astype(
+                block_pdf["__col_idx__"].dtype))
+            val = (np.ones(idx.size, dtype=np.int8) if binarize
+                   else cp.asnumpy(merged["count"].values.astype(cp.float32)))
             del gdf, merged
             cp.get_default_memory_pool().free_all_blocks()
             return idx, val
@@ -507,7 +534,7 @@ def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_stat
 
     # CPU path: chosen proactively, or after a GPU-OOM fallback.
     oom_state["cpu_fallbacks"] += 1
-    return _cpu_merge_block(df_g, block_pdf, key_cols)
+    return _cpu_merge_block(df_g, block_pdf, key_cols, binarize)
 
 
 def _force_kill_pool(pool):
@@ -633,7 +660,7 @@ def _shard_ranges(n, k):
 
 
 def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
-                      in_q, out_q, cpu_merge):
+                      in_q, out_q, cpu_merge, col_dtype, binarize):
     """One merge worker pinned to a single GPU.
 
     Holds one or more reference column-BLOCKS — ``block_ranges`` is a list of
@@ -679,7 +706,7 @@ def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
     blocks = []                                # (lo, hi, block_pdf, ref_gdf)
     for (lo, hi) in block_ranges:
         bp = full.iloc[lo:hi].copy()
-        bp["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
+        bp["__col_idx__"] = np.arange(lo, hi, dtype=col_dtype)
         gdf = None if cpu_merge else cudf.DataFrame.from_pandas(bp)
         blocks.append((lo, hi, bp, gdf))
     del full
@@ -696,7 +723,7 @@ def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
                 else _materialize(payload)
             for (lo, hi, bp, gdf) in blocks:  # one fragment per owned block
                 idx_np, val_np = _merge_genome_block(
-                    df_g, gdf, bp, key_cols, cudf, cp, oom_state)
+                    df_g, gdf, bp, key_cols, cudf, cp, oom_state, binarize)
                 out_q.put((g_idx, lo, idx_np, val_np, exp))
             del df_g
         except Exception as exc:              # surface to collector; never hang
@@ -711,6 +738,7 @@ def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
 
 
 def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words,
+                              col_dtype, val_dtype, binarize,
                               key_cols, kmer_size, blocks, work, sample_ids,
                               n_genomes, budget, ctx, spill_root, handoff_dir,
                               spill_bytes, gpu_layout, oom_state, progress,
@@ -745,7 +773,12 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     ref_path = os.path.join(spill_root, f"_ref_replica_{out_suffix}.parquet")
     ref_pdf.to_parquet(ref_path, index=False)
 
-    out_q = ctx.Queue()
+    # Bound the output queue so a transient collector stall can't let the GPU
+    # workers pile up unbounded fragments in RAM. The collector drains it
+    # continuously (and never blocks on the workers), so this is pure backpressure
+    # — workers block on put when full and resume as it drains; no deadlock. A
+    # dead collector is handled by the worker-join timeout + terminate below.
+    out_q = ctx.Queue(maxsize=max(16, 4 * D))
     # Build the worker set as a device mesh. `group_qs[r]` are the per-worker queues
     # of replica group r — a genome is broadcast to all of group r's workers and
     # gathered from them. Data-parallel/single is the degenerate mesh: one shared
@@ -774,16 +807,16 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     for (gid, block_ranges, q) in specs:
         p = ctx.Process(target=_gpu_merge_worker,
                         args=(gid, ref_path, block_ranges, key_cols, q, out_q,
-                              cpu_merge),
+                              cpu_merge, col_dtype, binarize),
                         daemon=True)
         p.start()
         workers.append(p)
 
     # ── Streaming in-order writer (same policy as the single-GPU path) ────────
-    col_fp = _npy_open_stream(os.path.join(out_dir, f"column_{out_suffix}.npy"),
-                              np.uint32)
-    val_fp = _npy_open_stream(os.path.join(out_dir, f"data_{out_suffix}.npy"),
-                              np.float32)
+    col_path = os.path.join(out_dir, f"column_{out_suffix}.npy")
+    val_path = os.path.join(out_dir, f"data_{out_suffix}.npy")
+    col_fp = _npy_open_stream(col_path, col_dtype)
+    val_fp = _npy_open_stream(val_path, val_dtype)
     sizes = np.zeros(n_genomes, dtype=np.int64)
     buf = {}            # g_idx -> (idx_np, val_np), full row waiting in RAM
     buf_spill = {}      # g_idx -> path, parked on disk (overflow)
@@ -795,8 +828,8 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     def _emit(gi, idx_np, val_np):
         sz = int(idx_np.size)
         if sz:
-            col_fp.write(memoryview(np.ascontiguousarray(idx_np, dtype=np.uint32)))
-            val_fp.write(memoryview(np.ascontiguousarray(val_np, dtype=np.float32)))
+            col_fp.write(memoryview(np.ascontiguousarray(idx_np, dtype=col_dtype)))
+            val_fp.write(memoryview(np.ascontiguousarray(val_np, dtype=val_dtype)))
             sizes[gi] = sz
             state["total_nnz"] += sz
             state["written_since_sync"] += sz * 8
@@ -947,11 +980,20 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     shutil.rmtree(handoff_dir, ignore_errors=True)
 
     if state["error"] is not None:
-        try:
-            _npy_finalize_stream(col_fp, np.uint32, state["total_nnz"])
-            _npy_finalize_stream(val_fp, np.float32, state["total_nnz"])
-        except Exception:
-            pass
+        # On failure, DELETE the partial column/data files rather than finalizing
+        # them — a finalized-but-truncated .npy looks like a valid (shorter) matrix
+        # and could be mistaken for a smaller-but-complete result. Removing them
+        # leaves no readable artifact; the run also exits non-zero and never writes
+        # row_*.npy, so a reload would fail loudly.
+        for _fp, _path in ((col_fp, col_path), (val_fp, val_path)):
+            try:
+                _fp.close()
+            except Exception:
+                pass
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
         raise state["error"]
 
     _drain()
@@ -964,8 +1006,8 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
             f"[stage 2] {len(gather)} genome(s) never received all of their "
             f"reference-shard fragment(s) — incomplete row(s), aborting")
 
-    _npy_finalize_stream(col_fp, np.uint32, state["total_nnz"])
-    _npy_finalize_stream(val_fp, np.float32, state["total_nnz"])
+    _npy_finalize_stream(col_fp, col_dtype, state["total_nnz"])
+    _npy_finalize_stream(val_fp, val_dtype, state["total_nnz"])
     progress.close()
 
     total_nnz = state["total_nnz"]
@@ -982,6 +1024,13 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     print("[3/3] decoding k-mers …", flush=True)
     with _quiet_kmc():
         decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
+    # column j ↔ ref_pdf row j (the positional __col_idx__). kmcpy.decode_kmers
+    # is fully vectorised and maps each row positionally — it does NOT sort or
+    # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
+    # future decode change that drops/reorders rows fails loudly, not silently.
+    assert len(decoded) == n_unique, (
+        f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+        f"k-mers — column↔k-mer legend would be misaligned")
     decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
     decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
     return (None, None, row_ptr, decoded, sparsity)
@@ -1015,18 +1064,24 @@ def _count_reference(flat_files, input_fmt, kmer_size, tmp_dir, min_val, max_val
 
 
 def _files_signature(flat_files) -> str:
-    """Order-independent signature of the input file set (basename + size).
+    """Strict signature of the input file set: absolute path + size + mtime.
 
-    Used for strict cache validation: a cached reference is only valid for the
-    exact files it was built from. Detects added/removed/resized inputs cheaply.
+    Used for cache validation — a cached reference is only valid for the exact
+    files it was built from. We key on (absolute path, byte size, mtime_ns), NOT
+    just basename+size: that would accept a *different* file of the same name and
+    size (a moved directory, or same-size replaced content) and silently merge
+    every genome against the wrong column space. Strict means false-rejection
+    (rebuild) over false-acceptance (corrupt matrix) — a copy/rsync that changes
+    mtime will trip it, which is the safe direction. Order-independent (sorted).
     """
     parts = []
     for f in sorted(flat_files):
         try:
-            sz = os.path.getsize(f)
+            st = os.stat(f)
+            sz, mt = st.st_size, st.st_mtime_ns
         except OSError:
-            sz = -1
-        parts.append(f"{os.path.basename(f)}:{sz}")
+            sz, mt = -1, -1
+        parts.append(f"{os.path.abspath(f)}:{sz}:{mt}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -1087,6 +1142,49 @@ def validate_reference(meta, kmer_size, min_val, max_val, canonical, flat_files)
             "  Rebuild it with --build-reference, or fix the parameters to match.")
 
 
+def load_csr(output_dir, *, suffix=None, device="cpu", shape=None):
+    """Load a KMX output as a ready-to-compute sparse CSR matrix.
+
+    Reads the ``column``/``data``/``row`` ``.npy`` arrays from a ``build()`` /
+    ``KMX -o`` run and returns a CSR matrix with the correct
+    ``(n_genomes × n_unique)`` shape and native dtypes (int32/int64 indices,
+    float32 values), so it plugs straight into downstream computation with NO
+    conversion:
+
+      * ``device="cpu"`` → ``scipy.sparse.csr_matrix`` (scipy / scikit-learn /
+        statsmodels — e.g. ``sklearn.feature_selection.chi2``).
+      * ``device="gpu"`` → ``cupyx.scipy.sparse.csr_matrix`` (RAPIDS — cuML / cuPy).
+
+    ``suffix`` is auto-detected when the directory holds exactly one matrix;
+    otherwise pass it (e.g. ``"k31_min5_max1000_d0"`` or ``..._presence``). The
+    column count comes from ``set_of_all_unique_kmers_<suffix>.csv`` (the full
+    reference width, so all-zero trailing columns aren't dropped); pass
+    ``shape=(n_rows, n_cols)`` to override.
+    """
+    import glob
+    if suffix is None:
+        cols = glob.glob(os.path.join(output_dir, "column_*.npy"))
+        if len(cols) != 1:
+            raise ValueError(
+                f"pass suffix=… — found {len(cols)} matrices in {output_dir!r}")
+        suffix = os.path.basename(cols[0])[len("column_"):-len(".npy")]
+    column = np.load(os.path.join(output_dir, f"column_{suffix}.npy"))
+    data   = np.load(os.path.join(output_dir, f"data_{suffix}.npy"))
+    row    = np.load(os.path.join(output_dir, f"row_{suffix}.npy"))
+    if shape is None:
+        kcsv = os.path.join(output_dir, f"set_of_all_unique_kmers_{suffix}.csv")
+        with open(kcsv) as fh:
+            n_cols = sum(1 for _ in fh) - 1            # minus the header row
+        shape = (int(row.size - 1), int(n_cols))
+    if device == "gpu":
+        import cupy as cp
+        import cupyx.scipy.sparse as cusparse
+        return cusparse.csr_matrix(
+            (cp.asarray(data), cp.asarray(column), cp.asarray(row)), shape=shape)
+    import scipy.sparse
+    return scipy.sparse.csr_matrix((data, column, row), shape=shape)
+
+
 def create_csr_matrix(
     sample_ids: List[str],
     files_by_sample: Dict[str, List[str]],
@@ -1103,6 +1201,7 @@ def create_csr_matrix(
     out_suffix: str = "",
     max_gpus: int = 0,
     reference_in: str = "",
+    binarize: bool = False,
 ):
     # GPU imports are *here*, not at module top, so spawn'd workers don't pull
     # cupy/cudf when they re-import this module. When KMX_CPU_MERGE is forced and
@@ -1180,7 +1279,7 @@ def create_csr_matrix(
         empty_idx_df = pd.DataFrame({"index": [], "K-mer": []})
         return (
             np.empty(0, dtype=np.float32),
-            np.empty(0, dtype=np.uint32),
+            np.empty(0, dtype=np.int32),
             np.zeros(n_genomes + 1, dtype=np.int64),
             empty_idx_df,
             100.0,
@@ -1205,6 +1304,24 @@ def create_csr_matrix(
                               _max_genome_bytes(files_by_sample), free_vram,
                               force=force)
     B = len(blocks)
+
+    # Column-index dtype, chosen from the reference size: uint32 for ≤ 4.29 B
+    # columns (the usual case; compact + backward-compatible), uint64 above it so
+    # very large references (huge-VRAM GPUs) can't silently overflow the index.
+    col_dtype = _col_index_dtype(n_unique)
+    if col_dtype != np.int32:
+        why = ("forced via KMX_COL_DTYPE" if os.environ.get("KMX_COL_DTYPE")
+               else f"reference has {n_unique:,} columns, exceeds the int32 limit "
+                    f"{np.iinfo(np.int32).max:,}")
+        print(f"  column index: {col_dtype} ({why})", flush=True)
+
+    # Value dtype: presence → int8 0/1 (4x smaller than float32 — a real VRAM/IO
+    # win at scale; safe for sums/chi-squared because scipy/numpy/cupy upcast the
+    # accumulator to int64). Counts → float32.
+    val_dtype = np.dtype(np.int8) if binarize else np.dtype(np.float32)
+    if binarize:
+        print("  values: presence/absence (int8 0/1, 4x smaller than float32)",
+              flush=True)
 
     # ── Plan the multi-GPU layout from the block count B ─────────────────────
     # B == 1 (reference fits one GPU) + >1 GPU → data-parallel (replicate ref,
@@ -1345,7 +1462,8 @@ def create_csr_matrix(
             and out_dir and out_suffix):
         return _build_streaming_multigpu(
             out_dir=out_dir, out_suffix=out_suffix, ref_pdf=ref_pdf,
-            n_unique=n_unique, n_words=n_words, key_cols=key_cols,
+            n_unique=n_unique, n_words=n_words, col_dtype=col_dtype,
+            val_dtype=val_dtype, binarize=binarize, key_cols=key_cols,
             kmer_size=kmer_size, blocks=blocks, work=work, sample_ids=sample_ids,
             n_genomes=n_genomes, budget=budget, ctx=ctx, spill_root=spill_root,
             handoff_dir=handoff_dir, spill_bytes=spill_bytes,
@@ -1356,13 +1474,13 @@ def create_csr_matrix(
         os.makedirs(out_dir, exist_ok=True)
         lo, hi = blocks[0]
         block_pdf = ref_pdf.iloc[lo:hi].copy()
-        block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
+        block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=col_dtype)
         ref_gdf_b = None if cudf is None else cudf.DataFrame.from_pandas(block_pdf)
 
         col_fp = _npy_open_stream(os.path.join(out_dir, f"column_{out_suffix}.npy"),
-                                  np.uint32)
+                                  col_dtype)
         val_fp = _npy_open_stream(os.path.join(out_dir, f"data_{out_suffix}.npy"),
-                                  np.float32)
+                                  val_dtype)
         buf = {}            # g_idx -> (idx_np, val_np), waiting in RAM
         buf_spill = {}      # g_idx -> path, parked on disk (overflow)
         buf_bytes = 0
@@ -1379,8 +1497,8 @@ def create_csr_matrix(
             if sz:
                 # Zero-copy write: hand the array's own buffer to the file (a
                 # memoryview), instead of .tobytes() which copies it first.
-                col_fp.write(memoryview(np.ascontiguousarray(idx_np, dtype=np.uint32)))
-                val_fp.write(memoryview(np.ascontiguousarray(val_np, dtype=np.float32)))
+                col_fp.write(memoryview(np.ascontiguousarray(idx_np, dtype=col_dtype)))
+                val_fp.write(memoryview(np.ascontiguousarray(val_np, dtype=val_dtype)))
                 sizes[gi] = sz
                 total_nnz += sz
                 written_since_sync += sz * 8
@@ -1402,7 +1520,7 @@ def create_csr_matrix(
                                              progress=progress):
             df_g = _materialize(res)
             idx_np, val_np = _merge_genome_block(
-                df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state)
+                df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state, binarize)
             del df_g
             buf[g_idx] = (idx_np, val_np)
             buf_bytes += idx_np.nbytes + val_np.nbytes
@@ -1444,8 +1562,8 @@ def create_csr_matrix(
         progress.close()
         import shutil
         shutil.rmtree(handoff_dir, ignore_errors=True)
-        _npy_finalize_stream(col_fp, np.uint32, total_nnz)
-        _npy_finalize_stream(val_fp, np.float32, total_nnz)
+        _npy_finalize_stream(col_fp, col_dtype, total_nnz)
+        _npy_finalize_stream(val_fp, val_dtype, total_nnz)
         if oom_state["cpu_fallbacks"]:
             print(f"      note: {oom_state['cpu_fallbacks']} merge(s) ran on the "
                   f"CPU (didn't fit VRAM, or forced) — slower, still correct.",
@@ -1460,6 +1578,11 @@ def create_csr_matrix(
         print("[3/3] decoding k-mers …", flush=True)
         with _quiet_kmc():
             decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
+        # decode_kmers maps rows positionally (no sort) → row j is column j; assert
+        # the 1:1 length so a future change can't silently misalign the legend.
+        assert len(decoded) == n_unique, (
+            f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+            f"k-mers — column↔k-mer legend would be misaligned")
         decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
         decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
         return (None, None, row_ptr, decoded, sparsity)
@@ -1469,7 +1592,7 @@ def create_csr_matrix(
         # Upload only this column-block of the reference; tag each row with its
         # GLOBAL column index (lo..hi). Keep the host copy for the OOM fallback.
         block_pdf = ref_pdf.iloc[lo:hi].copy()
-        block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=np.uint32)
+        block_pdf["__col_idx__"] = np.arange(lo, hi, dtype=col_dtype)
         ref_gdf_b = None if cudf is None else cudf.DataFrame.from_pandas(block_pdf)
 
         # Watchdog-driven counting: the generator yields each genome's hand-off
@@ -1479,7 +1602,7 @@ def create_csr_matrix(
                                              ctx, sample_ids, progress=progress):
             df_g = _materialize(res)   # in-memory df, or read back a spilled one
             idx_np, val_np = _merge_genome_block(
-                df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state)
+                df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state, binarize)
             del df_g
 
             if idx_np.size:
@@ -1544,13 +1667,13 @@ def create_csr_matrix(
         os.makedirs(out_dir, exist_ok=True)
         col_buf = np.lib.format.open_memmap(
             os.path.join(out_dir, f"column_{out_suffix}.npy"),
-            mode="w+", dtype=np.uint32, shape=(total_nnz,))
+            mode="w+", dtype=col_dtype, shape=(total_nnz,))
         val_buf = np.lib.format.open_memmap(
             os.path.join(out_dir, f"data_{out_suffix}.npy"),
-            mode="w+", dtype=np.float32, shape=(total_nnz,))
+            mode="w+", dtype=val_dtype, shape=(total_nnz,))
     else:
-        col_buf = np.empty(total_nnz, dtype=np.uint32)
-        val_buf = np.empty(total_nnz, dtype=np.float32)
+        col_buf = np.empty(total_nnz, dtype=col_dtype)
+        val_buf = np.empty(total_nnz, dtype=val_dtype)
     row_ptr   = np.empty(n_genomes + 1, dtype=np.int64)
     row_ptr[0] = 0
     np.cumsum(sizes, out=row_ptr[1:])
@@ -1592,6 +1715,13 @@ def create_csr_matrix(
     print("[3/3] assembling CSR matrix and decoding k-mers …", flush=True)
     with _quiet_kmc():
         decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
+    # column j ↔ ref_pdf row j (the positional __col_idx__). kmcpy.decode_kmers
+    # is fully vectorised and maps each row positionally — it does NOT sort or
+    # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
+    # future decode change that drops/reorders rows fails loudly, not silently.
+    assert len(decoded) == n_unique, (
+        f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+        f"k-mers — column↔k-mer legend would be misaligned")
     decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
     decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
 

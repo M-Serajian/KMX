@@ -112,6 +112,7 @@ KMX -l <manifest.csv> -k <kmer_size> -t <tmp_dir> -o <output_dir> [options]
 | `-o`, `--output` | yes | — | Output dir (created if absent). |
 | `--min` | no | `5` | Drop k-mers occurring fewer than this many times across the dataset. |
 | `--max` | no | `N/2` | Drop k-mers occurring more than this (default: half the genome count). Must be ≥ `--min`. |
+| `-p`, `--presence` | no | off | Store presence/absence (`int8` `0/1`) instead of counts — a 0/1 matrix for chi-squared / association tests, **4× smaller** than `float32` counts. Output files gain a `_presence` suffix. |
 | `-d`, `--disable-normalization` | no | off | Treat a k-mer and its reverse complement as distinct (default: canonical). |
 | `-T`, `--threads` | no | `0` | CPU threads; `0` = all cores. |
 | `--max-ram-gb` | no | `0` (auto) | Cap on host RAM for the in-memory accumulator before it spills to disk. `0` = auto from the cgroup/SLURM limit. |
@@ -218,25 +219,51 @@ Written to `-o`, with a suffix `k{K}_min{MIN}_max{MAX}_d{0|1}` (`d1` = normaliza
 
 | File | Description |
 |------|-------------|
-| `data_<suffix>.npy` | CSR non-zero values (counts). |
-| `column_<suffix>.npy` | CSR column indices. |
-| `row_<suffix>.npy` | CSR row pointers (row `i` = genome `i`, manifest order). |
+| `data_<suffix>.npy` | CSR values — `float32` counts (or `int8` `0/1` with `--presence`). |
+| `column_<suffix>.npy` | CSR column indices — signed `int32` (`int64` above ~2.1 B columns). |
+| `row_<suffix>.npy` | CSR row pointers (`int64`; row `i` = genome `i`, manifest order). |
 | `set_of_all_unique_kmers_<suffix>.csv` | Column index → k-mer string. |
 | `genome_index_<suffix>.csv` | Row index → `sample_id`. |
 | `feature_matrix_stats_<suffix>.txt` | Sparsity, parameters, processing time, peak GPU memory. |
 
+The arrays use **compute-native dtypes** so they load into `scipy.sparse` and `cupyx.scipy.sparse` (RAPIDS) with
+no conversion: **signed `int32`/`int64`** column indices (int64 only when the reference exceeds ~2.1 B columns),
+`int64` row pointers, and `float32` values (or `int8` `0/1` with `--presence`). `float32` counts are exact up to
+**16,777,216** (2²⁴) — far above any realistic per-genome k-mer count; a single k-mer occurring more than that in one
+genome would round, so use `--presence` (or treat such extreme counts with care) in that unusual case.
+
 ### Load the matrix
 
+One call returns a ready CSR with the correct shape — CPU (scipy) or GPU (RAPIDS):
+
 ```python
-import numpy as np, scipy.sparse          # or: import cupy as np, cupyx.scipy.sparse as scipy_sparse
-s = "k31_min5_max100_d0"
-M = scipy.sparse.csr_matrix((
-        np.load(f"data_{s}.npy"),
-        np.load(f"column_{s}.npy"),
-        np.load(f"row_{s}.npy")))
+import KMX
+M_cpu = KMX.load_csr("results/")                 # scipy.sparse.csr_matrix → scikit-learn, statsmodels
+M_gpu = KMX.load_csr("results/", device="gpu")   # cupyx.scipy.sparse.csr_matrix → cuML, CuPy (RAPIDS)
+
+# straight into a chi-squared feature test (presence/absence with --presence):
+from sklearn.feature_selection import chi2
+chi2_scores, p_values = chi2(M_cpu, labels)       # labels: one per genome (manifest order)
 ```
 
-Use `cupy` + `cupyx.scipy.sparse` for the GPU version.
+Or build it yourself from the three `.npy` files (pass the shape so all-zero trailing columns aren't dropped):
+
+```python
+import numpy as np, scipy.sparse
+s = "k31_min5_max100_d0"
+n_cols = sum(1 for _ in open(f"set_of_all_unique_kmers_{s}.csv")) - 1
+data, col, row = (np.load(f"{x}_{s}.npy") for x in ("data", "column", "row"))
+M = scipy.sparse.csr_matrix((data, col, row), shape=(row.size - 1, n_cols))
+```
+
+For RAPIDS, swap `numpy`→`cupy` and `scipy.sparse`→`cupyx.scipy.sparse`.
+
+**`--presence`** stores a 0/1 matrix (`int8` values) instead of counts — ideal for chi-squared / association tests.
+Beyond being the right input for those tests, the `int8` `data` array is **4× smaller than `float32` counts**, which
+meaningfully shrinks the VRAM and I/O footprint on large datasets (more genomes in flight per GPU, lighter spill/queue
+traffic). It stays correct for the sums those tests perform: `scipy`/`numpy`/`cupy` upcast the `int8` accumulator to
+`int64`, so column sums (e.g. inside `chi2`) don't overflow. (The only thing to avoid is an op that accumulates while
+*staying* `int8`, e.g. an `int8 @ int8` Gram product — not something standard association pipelines do.)
 
 ---
 
