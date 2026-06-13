@@ -222,6 +222,16 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--chunk-device-gb", dest="chunk_device_gb", type=float, default=0.0,
+        help=("After building, split the output matrix into device-sized COLUMN "
+              "chunks — each chunk holds ALL genomes (rows) but only a band of "
+              "k-mers, sized so one chunk fits a device with this many GB of "
+              "RAM/VRAM. Written to <output>/chunks_<suffix>/ with a manifest; "
+              "load one with KMX.load_chunk(dir, band_id). 0 = off (default). "
+              "Use for matrices too large to load whole on the target device.")
+    )
+
+    parser.add_argument(
         "-o", "--output", type=check_output_directory, required=False, default=None,
         help=("Path to the output directory where results will be stored. Required "
               "for a normal build; not needed with --build-reference.")

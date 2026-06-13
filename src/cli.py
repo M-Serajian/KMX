@@ -144,6 +144,7 @@ def build(
     max_gpus: int = 0,
     reference: str = "",
     presence: bool = False,
+    chunk_device_gb: float = 0.0,
     write_output: bool = True,
 ):
     """Build a genome × k-mer CSR matrix from a manifest — the same pipeline as the ``KMX`` CLI.
@@ -288,6 +289,15 @@ def build(
         cp.save(os.path.join(output_dir, f"row_{suffix}.npy"), row)
         log.info("Files saved successfully in %s", output_dir)
 
+        if chunk_device_gb and chunk_device_gb > 0:
+            # Split the just-written matrix into device-sized column chunks (all
+            # rows, a band of k-mers each) for streaming on small devices.
+            from .chunked_output import chunk_existing_output
+            man = chunk_existing_output(output_dir, suffix, device_gb=chunk_device_gb)
+            log.info("Chunked output: %d band(s) sized to %.3g GB devices → %s",
+                     man["n_bands"], chunk_device_gb,
+                     os.path.join(output_dir, f"chunks_{suffix}"))
+
     return data, column, row, unique_kmers, sparsity
 
 
@@ -323,6 +333,7 @@ def main() -> int:
                 max_gpus=args.max_gpus,
                 reference=args.reference,
                 presence=args.presence,
+                chunk_device_gb=args.chunk_device_gb,
             )
     except ManifestError as e:
         log.error("Manifest error: %s", e)
@@ -333,6 +344,20 @@ def main() -> int:
     except ImportError as e:
         log.error("RAPIDS cuDF/CuPy import failed — is the RAPIDS env active? (%s)", e)
         return 2
+    except Exception:                                   # noqa: BLE001
+        # Any other failure (e.g. a GPU merge worker died mid-run) has already
+        # cleaned up its partial output and re-raised. Report it with a full
+        # traceback, then HARD-exit: tearing down the parent's CUDA/cupy context
+        # at normal interpreter shutdown can itself wedge after an abnormal GPU
+        # worker death, which would hang the process long after the error is
+        # reported. os._exit bypasses atexit so a failed run always terminates
+        # promptly with a non-zero status.
+        import sys
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(5)
     return 0
 
 

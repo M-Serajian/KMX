@@ -242,7 +242,7 @@ def _buf_load_one(path: str):
 def _spill_chunk(fragments, tmp_dir: str, chunk_no: int) -> str:
     """Flush a list of accumulator fragments to a packed .npz chunk; return path.
 
-    ``fragments`` is a list of ``(g_idx, idx_uint32, val_float32)``. A chunk
+    ``fragments`` is a list of ``(g_idx, idx_int, val)``. A chunk
     stores, per fragment: its genome's manifest index (``gidxs``), the
     fragment's nnz (``sizes``), and the concatenated column indices (``idx``)
     and values (``val``). A genome may appear in several fragments (one per
@@ -437,7 +437,7 @@ def estimate_worker_df_gb(files_by_sample, kmer_size: int) -> float:
     (not spillable while being produced) sets, together with KMC's sort buffer,
     the per-worker footprint the budget uses to choose how many workers run at
     once. n_words = ceil(k/32) (KMC packs 32 two-bit bases per uint64); a row is
-    the packed key (8*n_words) plus a uint32 column index. #rows is bounded by
+    the packed key (8*n_words) plus a 4-byte column index. #rows is bounded by
     the genome's base count ~ its file bytes (one distinct k-mer per base, an
     upper bound). Single source of truth shared by the CLI log and the pipeline.
     """
@@ -483,7 +483,7 @@ def _col_index_dtype(n_unique):
 def _cpu_merge_block(df_g, block_pdf, key_cols, binarize=False):
     """Exact CPU (pandas) inner join — identical result to the cuDF merge."""
     merged = df_g.merge(block_pdf, on=key_cols, how="inner")  # block_pdf has __col_idx__
-    # Keep the column-index dtype the block was built with (uint32 or uint64) —
+    # Keep the column-index dtype the block was built with (int32 or int64) —
     # block_pdf["__col_idx__"] carries it, so the merge output already has it.
     idx = merged["__col_idx__"].to_numpy().astype(block_pdf["__col_idx__"].dtype)
     # binarize → presence/absence (uint8 1s); else the float32 count.
@@ -496,7 +496,7 @@ def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_stat
                         binarize=False):
     """Merge one genome's counts against one reference column-block.
 
-    Returns ``(col_idx_uint32_np, count_float32_np)`` for the k-mers of this
+    Returns ``(col_idx_np, val_np)`` for the k-mers of this
     genome that fall in this block. Runs on whichever device is **safe**: the
     GPU (cuDF inner join, fast) when this genome's transient fits the currently
     free VRAM with margin, otherwise an exact CPU (pandas) merge. The GPU path
@@ -519,7 +519,7 @@ def _merge_genome_block(df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_stat
         try:
             gdf = cudf.DataFrame.from_pandas(df_g)
             merged = gdf.merge(ref_gdf_b, on=key_cols, how="inner")
-            # Preserve the block's column-index dtype (uint32 or uint64).
+            # Preserve the block's column-index dtype (int32 or int64).
             idx = cp.asnumpy(merged["__col_idx__"].values.astype(
                 block_pdf["__col_idx__"].dtype))
             val = (np.ones(idx.size, dtype=np.int8) if binarize
@@ -597,6 +597,7 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
         pending = set(fut_to_g)
         done_genomes = set()
         hung = False
+        abort = False
         try:
             while pending:
                 # Poll in short steps so a stall shows a heartbeat instead of a
@@ -628,10 +629,19 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
                     # the whole block — the parent's ~1 GB/genome leak.
                     del result, fut
                 done.clear()
+        except GeneratorExit:
+            # The consumer abandoned us (e.g. the merge stage errored and broke
+            # out of its loop, dropping this generator). Do NOT let the finally's
+            # pool.shutdown(wait=True) block until every still-running count
+            # finishes — on a large manifest that is the entire stage-2 counting
+            # time, which read as a "hang" when aborting a failed run. Kill the
+            # pool's workers and propagate immediately.
+            abort = True
+            raise
         finally:
-            if hung:
+            if hung or abort:
                 _force_kill_pool(pool)
-            pool.shutdown(wait=not hung)
+            pool.shutdown(wait=not (hung or abort))
         remaining = [i for i in remaining if i not in done_genomes]
         if hung:
             preview = ", ".join(str(sample_ids[i]) for i in remaining[:3])
@@ -712,11 +722,22 @@ def _gpu_merge_worker(gpu_id, ref_parquet_path, block_ranges, key_cols,
     del full
     _reclaim_memory()
     oom_state = {"cpu_fallbacks": 0}
+    # Fault-injection hook (testing only): KMX_TEST_KILL_AFTER=N makes the worker
+    # pinned to device "0" die SILENTLY (no __error__/__done__) after N genomes.
+    # Kept as a regression trigger for the full abort path: the collector's
+    # dead-worker watchdog must surface it, the count pool must be force-killed
+    # (not drained), surviving workers SIGKILL-reaped, and the process must EXIT
+    # promptly — never hang at CUDA teardown. Inert unless the env var is set.
+    _kill_after = int(os.environ.get("KMX_TEST_KILL_AFTER", "0") or 0)
+    _processed = 0
 
     while True:
         item = in_q.get()
         if item is None:                      # sentinel → drain done, exit
             break
+        if _kill_after and str(gpu_id) == "0" and _processed >= _kill_after:
+            os._exit(137)                     # simulate SIGKILL: no error, no done
+        _processed += 1
         g_idx, payload, exp = item            # exp = fragments the row needs total
         try:
             df_g = payload if isinstance(payload, pd.DataFrame) \
@@ -888,15 +909,29 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
             _row_ready(g_idx, idx_full, val_full)
 
     def _collect():
-        """Drain fragments; gather + stream rows to disk in input order."""
+        """Drain fragments; gather + stream rows to disk in input order.
+
+        Watchdog for a SILENTLY dead worker (SIGKILL/host-OOM/driver crash — no
+        ``__error__``): a clean worker sends exactly one ``__done__`` before
+        exiting, so if more workers are dead than have signaled ``__done__`` while
+        rows remain, one died without finishing. This catches the case where a
+        single worker dies and the others are still alive — which the global
+        all-alive check misses, and which would otherwise HANG ``reference_parallel``
+        (per-worker queues: the dead worker's queue stops draining and dispatch
+        blocks on it forever). Setting ``state["error"]`` here also unblocks the
+        stuck dispatch, whose ``_put`` checks it each loop.
+        """
+        done = 0
         try:
             while state["received"] < n_genomes:
                 try:
                     item = out_q.get(timeout=10.0)
                 except queue.Empty:
-                    if not any(p.is_alive() for p in workers):
+                    n_dead = sum(1 for p in workers if not p.is_alive())
+                    if n_dead > done:        # a worker died without signaling done
                         state["error"] = RuntimeError(
-                            f"GPU merge workers exited with "
+                            f"a GPU merge worker died before finishing "
+                            f"({n_dead} dead, {done} clean exit(s)) — "
                             f"{n_genomes - state['received']} row(s) unmerged")
                         return
                     continue
@@ -907,6 +942,7 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
                         f"{sample_ids[item[1]]!r}: {item[2]}")
                     return
                 if tag == "__done__":
+                    done += 1
                     continue
                 g_idx, block_lo, idx_np, val_np, exp = item
                 _ingest(g_idx, block_lo, idx_np, val_np, exp)
@@ -955,23 +991,64 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
                 break
             _put(in_qs[0], (g_idx, res, 1))    # shared queue, 1 fragment per genome
 
-    for q in in_qs:                            # one stop sentinel per worker…
-        try:
-            q.put(None, timeout=30)
-        except queue.Full:
-            pass
-    if not grouped:                            # …the shared queue feeds D workers
-        for _ in range(D - 1):
+    if state["error"] is None:
+        # Clean finish: send one stop sentinel per worker so each drains and exits.
+        for q in in_qs:                        # one per dedicated queue…
             try:
-                in_qs[0].put(None, timeout=30)
+                q.put(None, timeout=30)
             except queue.Full:
+                pass
+        if not grouped:                        # …the shared queue feeds D workers
+            for _ in range(D - 1):
+                try:
+                    in_qs[0].put(None, timeout=30)
+                except queue.Full:
+                    pass
+    else:
+        # A worker died or errored: a graceful sentinel would block on the dead
+        # worker's full queue. Terminate the workers hard instead so cleanup can't
+        # hang — we're aborting and about to raise anyway.
+        for p in workers:
+            try:
+                p.terminate()
+            except Exception:
                 pass
 
     collector.join()
+    # Reap workers, escalating to SIGKILL. A worker wedged inside a CUDA driver
+    # call ignores SIGTERM (p.terminate), so a plain terminate would leave it
+    # alive — and because the workers are daemons, multiprocessing's atexit
+    # handler then force-joins them with NO timeout, hanging the whole process
+    # at interpreter shutdown (observed: the error is reported, then the run
+    # hangs to the wall-clock limit). SIGKILL (p.kill) is the only reliable
+    # escalation, so every worker is dead before we return and atexit finds
+    # nothing to join. On the clean path the workers already exited on their
+    # sentinel, so the first join returns immediately and nothing escalates.
+    grace = 30 if state["error"] is None else 5
     for p in workers:
-        p.join(timeout=60)
+        p.join(timeout=grace)
         if p.is_alive():
-            p.terminate()
+            try:
+                p.terminate()                  # SIGTERM
+            except Exception:
+                pass
+            p.join(timeout=5)
+        if p.is_alive():
+            try:
+                p.kill()                       # SIGKILL — survives a wedged CUDA call
+            except Exception:
+                pass
+            p.join(timeout=5)
+    # Don't let a parent-side queue feeder thread block process exit: if a worker
+    # died with items still queued (error path), its queue's feeder is stuck
+    # flushing to a pipe with no reader, and Python would join it forever at exit.
+    # cancel_join_thread() drops that join. Harmless on the clean path (all
+    # delivered → nothing to flush). out_q's feeders live in the workers (gone).
+    for q in in_qs:
+        try:
+            q.cancel_join_thread()
+        except Exception:
+            pass
 
     try:
         os.remove(ref_path)
@@ -1028,9 +1105,10 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
     # is fully vectorised and maps each row positionally — it does NOT sort or
     # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
     # future decode change that drops/reorders rows fails loudly, not silently.
-    assert len(decoded) == n_unique, (
-        f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
-        f"k-mers — column↔k-mer legend would be misaligned")
+    if len(decoded) != n_unique:           # if/raise (survives python -O, unlike assert)
+        raise RuntimeError(
+            f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+            f"k-mers — column↔k-mer legend would be misaligned")
     decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
     decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
     return (None, None, row_ptr, decoded, sparsity)
@@ -1063,25 +1141,47 @@ def _count_reference(flat_files, input_fmt, kmer_size, tmp_dir, min_val, max_val
     return ref_pdf
 
 
-def _files_signature(flat_files) -> str:
-    """Strict signature of the input file set: absolute path + size + mtime.
+def _file_fingerprint(path) -> str:
+    """Content fingerprint of one file: size + sha256 of its first and last 64 KiB.
 
-    Used for cache validation — a cached reference is only valid for the exact
-    files it was built from. We key on (absolute path, byte size, mtime_ns), NOT
-    just basename+size: that would accept a *different* file of the same name and
-    size (a moved directory, or same-size replaced content) and silently merge
-    every genome against the wrong column space. Strict means false-rejection
-    (rebuild) over false-acceptance (corrupt matrix) — a copy/rsync that changes
-    mtime will trip it, which is the safe direction. Order-independent (sorted).
+    Keyed on CONTENT, not path or mtime, so it is **stable under stage-in** (the
+    same data copied to node-local scratch with fresh paths/mtimes fingerprints
+    identically — no false cache rebuild), while still catching real content
+    changes (different bytes → different hash) and added/removed files (the set of
+    fingerprints changes). It does NOT read the whole file, so it stays cheap even
+    for very large inputs. The only miss is a change confined to the middle of a
+    file that preserves its exact size and both 64 KiB ends — vanishingly unlikely
+    for real sequence files.
     """
-    parts = []
-    for f in sorted(flat_files):
-        try:
-            st = os.stat(f)
-            sz, mt = st.st_size, st.st_mtime_ns
-        except OSError:
-            sz, mt = -1, -1
-        parts.append(f"{os.path.abspath(f)}:{sz}:{mt}")
+    blk = 1 << 16
+    try:
+        sz = os.path.getsize(path)
+    except OSError:
+        return "missing"
+    h = hashlib.sha256()
+    h.update(str(sz).encode())
+    try:
+        with open(path, "rb") as fh:
+            h.update(fh.read(blk))
+            if sz > 2 * blk:
+                fh.seek(-blk, os.SEEK_END)
+                h.update(fh.read(blk))
+    except OSError:
+        return f"unreadable:{sz}"
+    return h.hexdigest()
+
+
+def _files_signature(flat_files) -> str:
+    """Order-independent CONTENT signature of the input file set.
+
+    A cached reference is valid only for the exact file *contents* it was built
+    from. We hash the sorted per-file content fingerprints (see
+    :func:`_file_fingerprint`) — not basenames, paths, or mtimes — so the cache
+    survives restaging/moves of identical data (no false rebuild) but rejects any
+    content or file-set change (which would silently merge genomes against the
+    wrong column space).
+    """
+    parts = sorted(_file_fingerprint(f) for f in flat_files)
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -1305,9 +1405,9 @@ def create_csr_matrix(
                               force=force)
     B = len(blocks)
 
-    # Column-index dtype, chosen from the reference size: uint32 for ≤ 4.29 B
-    # columns (the usual case; compact + backward-compatible), uint64 above it so
-    # very large references (huge-VRAM GPUs) can't silently overflow the index.
+    # Column-index dtype, chosen from the reference size: signed int32 for ≤ 2.15 B
+    # columns (the usual case; scipy/cupyx-native, compact), int64 above it so very
+    # large references (huge-VRAM GPUs) can't silently overflow the index.
     col_dtype = _col_index_dtype(n_unique)
     if col_dtype != np.int32:
         why = ("forced via KMX_COL_DTYPE" if os.environ.get("KMX_COL_DTYPE")
@@ -1580,9 +1680,10 @@ def create_csr_matrix(
             decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
         # decode_kmers maps rows positionally (no sort) → row j is column j; assert
         # the 1:1 length so a future change can't silently misalign the legend.
-        assert len(decoded) == n_unique, (
-            f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
-            f"k-mers — column↔k-mer legend would be misaligned")
+        if len(decoded) != n_unique:       # if/raise (survives python -O)
+            raise RuntimeError(
+                f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+                f"k-mers — column↔k-mer legend would be misaligned")
         decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
         decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
         return (None, None, row_ptr, decoded, sparsity)
@@ -1719,9 +1820,10 @@ def create_csr_matrix(
     # is fully vectorised and maps each row positionally — it does NOT sort or
     # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
     # future decode change that drops/reorders rows fails loudly, not silently.
-    assert len(decoded) == n_unique, (
-        f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
-        f"k-mers — column↔k-mer legend would be misaligned")
+    if len(decoded) != n_unique:           # if/raise (survives python -O, unlike assert)
+        raise RuntimeError(
+            f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
+            f"k-mers — column↔k-mer legend would be misaligned")
     decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
     decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
 
@@ -1735,7 +1837,7 @@ def create_csr_matrix(
 
     return (
         val_buf,         # numpy float32, on CPU
-        col_buf,         # numpy uint32,  on CPU
+        col_buf,         # numpy int32/int64,  on CPU
         row_ptr,         # numpy int64,   on CPU
         decoded,
         sparsity,
