@@ -18,7 +18,8 @@ from .create_csr_matrix import create_csr_matrix
 from .manifest import parse_manifest, write_genome_index, ManifestError
 from .ram_budget import plan_ram_budget, available_cpus
 from .create_csr_matrix import (
-    estimate_worker_df_gb, _count_reference, save_reference)
+    estimate_worker_df_gb, _count_reference, save_reference, set_warn_hook)
+from .distributed.runlog import RunLogger
 
 log = logging.getLogger(__name__)
 
@@ -223,6 +224,14 @@ def build(
         worker_df_gb=estimate_worker_df_gb(m.files_by_sample, kmer_size))
     log.info("%s", ram_budget.describe())
 
+    # Per-run report + isolation: a unique run dir under output_dir, peak host RAM
+    # sampling, and a warnings sink so per-genome KMC crash/retry notices are recorded.
+    runrep = RunLogger(output_dir, params=dict(
+        k=kmer_size, min=min_count, max=max_count,
+        canonical=not disable_normalization, input_fmt=m.input_fmt,
+        presence=presence, reference=("cached" if reference else "inline")))
+    set_warn_hook(runrep.warn)
+
     monitor = GPUMemoryMonitor(cp=cp, interval=1.0)
     monitor.start()
     t0 = time.time()
@@ -231,29 +240,42 @@ def build(
                 + ("_presence" if presence else ""))
 
     try:
-        data, column, row, unique_kmers, sparsity = create_csr_matrix(
-            sample_ids=m.sample_ids,
-            files_by_sample=m.files_by_sample,
-            flat_files=m.flat_files,
-            input_fmt=m.input_fmt,
-            kmer_size=kmer_size,
-            tmp_dir=tmp_dir,
-            min_val=min_count,
-            max_val=max_count,
-            disable_normalization=disable_normalization,
-            threads=threads,
-            max_ram_gb=max_ram_gb,
-            max_gpus=max_gpus,
-            reference_in=reference,
-            binarize=presence,
-            out_dir=output_dir if write_output else "",
-            out_suffix=suffix if write_output else "",
+        with runrep.stage("matrix_build"):
+            data, column, row, unique_kmers, sparsity = create_csr_matrix(
+                sample_ids=m.sample_ids,
+                files_by_sample=m.files_by_sample,
+                flat_files=m.flat_files,
+                input_fmt=m.input_fmt,
+                kmer_size=kmer_size,
+                tmp_dir=tmp_dir,
+                min_val=min_count,
+                max_val=max_count,
+                disable_normalization=disable_normalization,
+                threads=threads,
+                max_ram_gb=max_ram_gb,
+                max_gpus=max_gpus,
+                reference_in=reference,
+                binarize=presence,
+                out_dir=output_dir if write_output else "",
+                out_suffix=suffix if write_output else "",
         )
     finally:
         monitor.stop()
+        set_warn_hook(None)
 
     elapsed   = datetime.timedelta(seconds=(time.time() - t0))
     peak_used = monitor.peak_gb()
+
+    # Professional per-run report (run_report.txt/json under output_dir/run_<id>/):
+    # dimensions + sparsity, resources incl. peak host RAM + peak VRAM, timing, and any
+    # per-genome KMC crash/retry WARNINGS captured during the run.
+    # streamed paths return the column COUNT (int) and write the legend CSV themselves
+    # (bounded memory); the in-RAM path returns the decoded k-mer DataFrame.
+    _n_unique = unique_kmers if isinstance(unique_kmers, int) else len(unique_kmers)
+    runrep.set(peak_gpu_vram_gb_cupy=round(peak_used, 2))
+    runrep.finalize(n_genomes=n_genomes, n_kept=n_genomes,
+                    rows=n_genomes, cols=_n_unique, nnz=int(row[-1]),
+                    reference_kmers=_n_unique, output_dir=output_dir)
 
     if write_output:
         stats_text = (
@@ -277,8 +299,11 @@ def build(
             f"Peak GPU memory used (cupy memGetInfo): {peak_used:.2f} GB\n"
         )
         write_stats(os.path.join(output_dir, f"feature_matrix_stats_{suffix}.txt"), stats_text)
-        unique_kmers.to_csv(
-            os.path.join(output_dir, f"set_of_all_unique_kmers_{suffix}.csv"), index=False)
+        # streamed path: create_csr_matrix already wrote the legend CSV in bounded-memory
+        # batches; only the in-RAM path returns a DataFrame to write here.
+        if not isinstance(unique_kmers, int):
+            unique_kmers.to_csv(
+                os.path.join(output_dir, f"set_of_all_unique_kmers_{suffix}.csv"), index=False)
         write_genome_index(output_dir, suffix, m.sample_ids)
         # data/column are None when create_csr_matrix already streamed them to
         # disk (the normal path); only save them here for the in-RAM path.

@@ -192,6 +192,6 @@ rmm_log.txt
 # But do not ignore setup.sh
 !setup.sh
 trashcan/*
-
+archive/*
 tmp/*
 !tmp/.keep

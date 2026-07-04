@@ -45,6 +45,58 @@ import time
 import uuid
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures.process import BrokenProcessPool
+
+# Optional warning sink (set by the CLI's RunLogger) so per-genome KMC crash/retry
+# notices land in the run report, not just the console. None -> no-op.
+_RUN_WARN = None
+
+
+def set_warn_hook(fn):
+    """Register a callback(str) for non-fatal warnings (e.g. a genome's KMC crash +
+    retry). The CLI points this at its RunLogger so warnings appear in the run report."""
+    global _RUN_WARN
+    _RUN_WARN = fn
+
+
+def _write_legend_streamed(ref_pdf, kmer_size, n_unique, out_dir, out_suffix,
+                           batch=4_000_000):
+    """Write the k-mer legend CSV (``set_of_all_unique_kmers_<suffix>.csv``) by decoding
+    the reference in BATCHES, so peak host RAM is bounded by ~``batch`` k-mers instead of
+    materialising ALL reference k-mers as Python strings at once.
+
+    The matrix is already streamed to disk; decoding the whole reference legend in one
+    shot was the last unbounded step — for a human-scale reference (tens of millions of
+    k-mers) it spikes several GB and can OOM a tight box at the finish line. Batching it
+    makes the entire output path memory-bounded.
+
+    decode_kmers maps rows positionally (no sort) → row j is column j's k-mer; the per-
+    batch length is asserted so a decode change can't silently misalign the legend.
+    Written to a temp file and atomically renamed, so a partial legend never appears.
+    """
+    import pandas as pd
+    n = len(ref_pdf)
+    if n != n_unique:
+        raise RuntimeError(f"reference has {n} rows but n_unique={n_unique}")
+    path = os.path.join(out_dir, f"set_of_all_unique_kmers_{out_suffix}.csv")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("index,K-mer\n")
+        for lo in range(0, n, batch):
+            hi = min(lo + batch, n)
+            with _quiet_kmc():
+                dec = kmcpy.decode_kmers(ref_pdf.iloc[lo:hi], k=kmer_size)
+            if len(dec) != hi - lo:        # legend must stay 1:1 with columns
+                raise RuntimeError(
+                    f"decode_kmers returned {len(dec)} rows for {hi - lo} k-mers "
+                    f"(batch {lo}:{hi}) — column↔k-mer legend would misalign")
+            kcol = dec["kmer"].to_numpy() if "kmer" in dec.columns else dec.iloc[:, 0].to_numpy()
+            pd.DataFrame({"index": np.arange(lo, hi, dtype=np.int64), "K-mer": kcol}
+                         ).to_csv(fh, header=False, index=False)
+            del dec, kcol
+            _reclaim_memory()
+    os.replace(tmp, path)
+    return path
 from typing import Dict, List
 
 import numpy as np
@@ -185,7 +237,8 @@ def _count_one_genome(args):
             decoded=False,
             drop_count=False,
         )
-    if spill_bytes and int(df.memory_usage(index=False, deep=True).sum()) >= spill_bytes:
+    df_bytes = int(df.memory_usage(index=False, deep=True).sum())
+    if spill_bytes and df_bytes >= spill_bytes:
         # Unique name (pid + uuid4) -> never collides across workers, genomes,
         # or watchdog retries. Written fully before the path is returned, so the
         # parent only ever reads a complete file.
@@ -198,11 +251,14 @@ def _count_one_genome(args):
         except Exception:                       # disk full / IO error -> degrade
             try: os.remove(path)
             except OSError: pass               # to in-memory rather than failing
-    # Hand back the table, but first return KMC's freed-but-retained sort/decode
-    # arenas to the OS, so this pooled worker's RSS drops to ~the table size
-    # before it picks up the next genome instead of lingering at the count-time
-    # peak (glibc keeps freed arenas; that retention let pooled workers climb).
-    _reclaim_memory()
+    # Return KMC's freed-but-retained sort/decode arenas to the OS so this pooled
+    # worker's RSS doesn't linger at the count-time peak — but ONLY when the table
+    # is large enough for that arena to matter. For tiny genomes the arena is small
+    # and glibc reuses it, so a per-genome gc.collect() there is pure overhead (it
+    # became the stage-2 ceiling once the parent's per-genome reclaim was removed).
+    # Memory management only; the returned table is unchanged.
+    if df_bytes >= RECLAIM_WORKER_BYTES:
+        _reclaim_memory()
     return ("mem", df)
 
 
@@ -413,6 +469,21 @@ def _flush_release(*arrs) -> None:
                 pass
 
 
+# Stage-2 reclaim cadence (memory management only — never affects the output matrix).
+# A full gc.collect()+malloc_trim() costs ~100+ ms once the reference/heap is large, so
+# doing it on EVERY genome dominated stage 2 (covid_N100000: ~91% of runtime). Reclaim
+# every RECLAIM_EVERY genomes, OR sooner if the parent RSS has grown RECLAIM_GROWTH_GB
+# since the last reclaim (keeps the large-per-genome-table path flat). Genome-count /
+# RSS based -> independent of -T (number of CPUs/workers).
+RECLAIM_EVERY = 256
+RECLAIM_GROWTH_GB = 4.0
+# Worker (per-genome counter): only reclaim KMC's retained arenas when the produced
+# table is at least this big. Tiny genomes leave a small, reused arena, so the
+# per-genome gc.collect() there is pure overhead (it became the stage-2 ceiling once
+# the parent-side per-genome reclaim was removed). Large genomes still reclaim.
+RECLAIM_WORKER_BYTES = 32 * 1024 * 1024
+
+
 def _reclaim_memory() -> None:
     """Return freed heap pages to the OS.
 
@@ -566,7 +637,7 @@ def _force_kill_pool(pool):
 def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
                        deadline_s=_STAGE2_DEADLINE_S,
                        max_attempts=_MAX_BLOCK_ATTEMPTS,
-                       worker_fn=None, progress=None):
+                       worker_fn=None, progress=None, max_crash_retries=2):
     """Yield (genome_index, worker_result) for each genome, deadlock-proof.
 
     Runs ``worker_fn`` (default :func:`_count_one_genome`) over ``indices`` in a
@@ -583,7 +654,17 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
     if worker_fn is None:
         worker_fn = _count_one_genome
     remaining = list(indices)
+    crash_count = {}                  # g_idx -> times its worker raised (persists across attempts)
     attempt = 0
+
+    def _warn(msg):
+        if _RUN_WARN is not None:
+            _RUN_WARN(msg)
+        elif progress is not None:
+            progress.note("      ⚠ " + msg)
+        else:
+            print("      ⚠ " + msg, flush=True)
+
     while remaining:
         attempt += 1
         if attempt > max_attempts:
@@ -598,6 +679,7 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
         done_genomes = set()
         hung = False
         abort = False
+        pool_broke = False
         try:
             while pending:
                 # Poll in short steps so a stall shows a heartbeat instead of a
@@ -620,7 +702,28 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
                     break
                 for fut in done:
                     g_idx = fut_to_g.pop(fut)   # stop retaining this future…
-                    result = fut.result()
+                    try:
+                        result = fut.result()
+                    except BrokenProcessPool:
+                        # a worker PROCESS died (KMC segfault / OOM-kill) -> the pool is
+                        # poisoned and this genome is collateral, not necessarily the cause.
+                        # Re-queue everything not yet done and retry with a FRESH pool;
+                        # don't blame this genome (no crash_count bump).
+                        pool_broke = True
+                        _warn(f"a KMC worker process died — re-queuing "
+                              f"{len(pending) + 1} unfinished genome(s) on a fresh pool")
+                        break
+                    except Exception as e:      # worker RAISED -> KMC failed on THIS genome
+                        crash_count[g_idx] = crash_count.get(g_idx, 0) + 1
+                        if crash_count[g_idx] > max_crash_retries:
+                            raise RuntimeError(
+                                f"[stage 2] genome sample_id={sample_ids[g_idx]!r} failed "
+                                f"in KMC across {max_crash_retries} retries "
+                                f"({type(e).__name__}: {e})") from e
+                        _warn(f"genome sample_id={sample_ids[g_idx]!r} KMC crash "
+                              f"({type(e).__name__}: {e}) — retry "
+                              f"{crash_count[g_idx]}/{max_crash_retries}")
+                        continue                # NOT added to done_genomes -> retried below
                     done_genomes.add(g_idx)
                     yield g_idx, result
                     # …and drop the result + future once the consumer has merged
@@ -629,6 +732,8 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
                     # the whole block — the parent's ~1 GB/genome leak.
                     del result, fut
                 done.clear()
+                if pool_broke:
+                    break
         except GeneratorExit:
             # The consumer abandoned us (e.g. the merge stage errored and broke
             # out of its loop, dropping this generator). Do NOT let the finally's
@@ -639,9 +744,9 @@ def _completed_genomes(work_items, indices, n_cpus, ctx, sample_ids,
             abort = True
             raise
         finally:
-            if hung or abort:
+            if hung or abort or pool_broke:
                 _force_kill_pool(pool)
-            pool.shutdown(wait=not (hung or abort))
+            pool.shutdown(wait=not (hung or abort or pool_broke))
         remaining = [i for i in remaining if i not in done_genomes]
         if hung:
             preview = ", ".join(str(sample_ids[i]) for i in remaining[:3])
@@ -1098,20 +1203,9 @@ def _build_streaming_multigpu(*, out_dir, out_suffix, ref_pdf, n_unique, n_words
              else f"{D}× GPU data-parallel")
     print(f"      → {total_nnz:,} nonzeros · {sparsity:.1f}% sparse  "
           f"({time.time()-t0:.1f}s · {_mode}, streamed, input order)", flush=True)
-    print("[3/3] decoding k-mers …", flush=True)
-    with _quiet_kmc():
-        decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
-    # column j ↔ ref_pdf row j (the positional __col_idx__). kmcpy.decode_kmers
-    # is fully vectorised and maps each row positionally — it does NOT sort or
-    # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
-    # future decode change that drops/reorders rows fails loudly, not silently.
-    if len(decoded) != n_unique:           # if/raise (survives python -O, unlike assert)
-        raise RuntimeError(
-            f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
-            f"k-mers — column↔k-mer legend would be misaligned")
-    decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
-    decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
-    return (None, None, row_ptr, decoded, sparsity)
+    print("[3/3] decoding k-mers (streamed legend) …", flush=True)
+    _write_legend_streamed(ref_pdf, kmer_size, n_unique, out_dir, out_suffix)
+    return (None, None, row_ptr, n_unique, sparsity)
 
 
 # ── Reference set: build (stage 1) + on-disk cache ──────────────────────────
@@ -1615,12 +1709,19 @@ def create_csr_matrix(
                 next_write += 1
 
         _gcount = 0
+        _rss_last_reclaim = _proc_rss_gb()
+        _PROF = os.environ.get("KMX_PROFILE", "") not in ("", "0")
+        _prof_mat = 0.0; _prof_merge = 0.0
         for g_idx, res in _completed_genomes(work, range(n_genomes),
                                              budget.n_workers, ctx, sample_ids,
                                              progress=progress):
+            _t_m0 = time.time()
             df_g = _materialize(res)
+            _prof_mat += time.time() - _t_m0
+            _t_mg = time.time()
             idx_np, val_np = _merge_genome_block(
                 df_g, ref_gdf_b, block_pdf, key_cols, cudf, cp, oom_state, binarize)
+            _prof_merge += time.time() - _t_mg
             del df_g
             buf[g_idx] = (idx_np, val_np)
             buf_bytes += idx_np.nbytes + val_np.nbytes
@@ -1632,11 +1733,17 @@ def create_csr_matrix(
                 buf_spill[gmax] = _buf_spill_one(spill_root, gmax, i2, v2)
             progress.update()
             _gcount += 1
-            try:
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-            _reclaim_memory()
+            # Reclaim every RECLAIM_EVERY genomes, or sooner if parent RSS climbed
+            # RECLAIM_GROWTH_GB — not on every genome (the gc.collect() dominated
+            # stage 2). Memory management only; the streamed output is unchanged.
+            if (_gcount % RECLAIM_EVERY == 0
+                    or _proc_rss_gb() - _rss_last_reclaim > RECLAIM_GROWTH_GB):
+                try:
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                _reclaim_memory()
+                _rss_last_reclaim = _proc_rss_gb()
             if written_since_sync >= (1 << 30):          # bound output page cache
                 for _fp in (col_fp, val_fp):
                     _fp.flush()
@@ -1673,22 +1780,20 @@ def create_csr_matrix(
         np.cumsum(sizes, out=row_ptr[1:])
         sparsity = (100.0 * (1.0 - total_nnz / float(n_genomes * n_unique))
                     if n_unique else 100.0)
+        _s2 = time.time() - t0
         print(f"      → {total_nnz:,} nonzeros · {sparsity:.1f}% sparse  "
-              f"({time.time()-t0:.1f}s · streamed, input order)", flush=True)
-        print("[3/3] decoding k-mers …", flush=True)
-        with _quiet_kmc():
-            decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
-        # decode_kmers maps rows positionally (no sort) → row j is column j; assert
-        # the 1:1 length so a future change can't silently misalign the legend.
-        if len(decoded) != n_unique:       # if/raise (survives python -O)
-            raise RuntimeError(
-                f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
-                f"k-mers — column↔k-mer legend would be misaligned")
-        decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
-        decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
-        return (None, None, row_ptr, decoded, sparsity)
+              f"({_s2:.1f}s · streamed, input order)", flush=True)
+        if _PROF:
+            print(f"[KMX2 PROFILE] stage2_total={_s2:.1f}s  "
+                  f"count(remainder)={_s2-_prof_merge-_prof_mat:.1f}s  "
+                  f"materialize={_prof_mat:.1f}s  merge={_prof_merge:.1f}s  "
+                  f"(genomes={n_genomes}, cols={n_unique:,})", flush=True)
+        print("[3/3] decoding k-mers (streamed legend) …", flush=True)
+        _write_legend_streamed(ref_pdf, kmer_size, n_unique, out_dir, out_suffix)
+        return (None, None, row_ptr, n_unique, sparsity)
 
     _gcount = 0  # genomes merged so far (across blocks), for the memory probe
+    _rss_last_reclaim = _proc_rss_gb()
     for b, (lo, hi) in enumerate(blocks):
         # Upload only this column-block of the reference; tag each row with its
         # GLOBAL column index (lo..hi). Keep the host copy for the OOM fallback.
@@ -1725,13 +1830,19 @@ def create_csr_matrix(
             # Per genome the parent merges a large table on the GPU; the freed
             # HOST buffers (glibc arenas + cuDF/cupy PINNED host pool) are not
             # returned to the OS on their own, so the parent's RSS would climb
-            # ~1 GB/genome and OOM any box. Reclaim every genome to stay flat.
+            # ~1 GB/genome. Reclaim when RSS has grown RECLAIM_GROWTH_GB since the
+            # last reclaim (so big-table runs stay flat), or every RECLAIM_EVERY
+            # genomes as a floor — not blindly every genome (wasteful when the
+            # tables are small). Memory management only; the matrix is unchanged.
             _gcount += 1
-            try:
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-            _reclaim_memory()
+            if (_gcount % RECLAIM_EVERY == 0
+                    or _proc_rss_gb() - _rss_last_reclaim > RECLAIM_GROWTH_GB):
+                try:
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                _reclaim_memory()
+                _rss_last_reclaim = _proc_rss_gb()
             if _gcount % 10 == 0:
                 _self, _kids = _proc_rss_gb(), _children_rss_gb()
                 progress.note(f"      [mem@{_gcount}] parent={_self:.1f} GB  "
@@ -1814,26 +1925,27 @@ def create_csr_matrix(
 
     # ── Stage 3: decode reference keys to ACGT for the user-facing CSV ──────
     print("[3/3] assembling CSR matrix and decoding k-mers …", flush=True)
+    if _memmap_out:
+        # Streamed output: flush column/data to disk and drop the memmaps — the .npy
+        # files are now complete on disk, so signal the caller (cli) NOT to re-save them.
+        # Then write the legend in BATCHES (bounded RAM) instead of decoding the whole
+        # reference at once, which is what OOMs a tight box for a huge reference.
+        col_buf.flush(); val_buf.flush()
+        del col_buf, val_buf
+        _reclaim_memory()
+        _write_legend_streamed(ref_pdf, kmer_size, n_unique, out_dir, out_suffix)
+        return (None, None, row_ptr, n_unique, sparsity)
+
+    # In-RAM path (matrix fits memory): decode the whole legend — fine here, the matrix
+    # is already held in RAM. decode_kmers maps rows positionally → row j is column j.
     with _quiet_kmc():
         decoded = kmcpy.decode_kmers(ref_pdf, k=kmer_size)
-    # column j ↔ ref_pdf row j (the positional __col_idx__). kmcpy.decode_kmers
-    # is fully vectorised and maps each row positionally — it does NOT sort or
-    # reorder — so decoded row j IS column j's k-mer. Assert the 1:1 length so a
-    # future decode change that drops/reorders rows fails loudly, not silently.
     if len(decoded) != n_unique:           # if/raise (survives python -O, unlike assert)
         raise RuntimeError(
             f"decode_kmers returned {len(decoded)} rows for {n_unique} reference "
             f"k-mers — column↔k-mer legend would be misaligned")
     decoded.insert(0, "index", np.arange(n_unique, dtype=np.int64))
     decoded.rename(columns={"kmer": "K-mer"}, inplace=True)
-
-    if _memmap_out:
-        # Flush column/data to disk and drop the memmaps — the .npy files are now
-        # complete on disk, so signal the caller (cli) NOT to re-save them.
-        col_buf.flush(); val_buf.flush()
-        del col_buf, val_buf
-        _reclaim_memory()
-        return (None, None, row_ptr, decoded, sparsity)
 
     return (
         val_buf,         # numpy float32, on CPU

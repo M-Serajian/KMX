@@ -372,6 +372,25 @@ def read_manifest(chunks_dir):
         return json.load(fh)
 
 
+def read_kmers(chunks_dir, *, manifest=None):
+    """Global ordered k-mer legend: column id -> k-mer string, reassembled from the
+    per-band kmers.csv files (each holds LOCAL ids; global col = band.c0 + local).
+    Returns a list of length n_cols (None for any column whose legend wasn't written)."""
+    m = manifest or read_manifest(chunks_dir)
+    out = [None] * int(m["n_cols"])
+    for b in m["bands"]:
+        path = os.path.join(chunks_dir, b["dir"], "kmers.csv")
+        if not os.path.exists(path):
+            continue
+        c0 = int(b["c0"])
+        with open(path) as fh:
+            next(fh)
+            for ln in fh:
+                idx, km = ln.rstrip("\n").split(",", 1)
+                out[c0 + int(idx)] = km
+    return out
+
+
 def _chunk_rec(manifest, chunk_id):
     for ch in manifest["chunks"]:
         if ch["id"] == chunk_id:
