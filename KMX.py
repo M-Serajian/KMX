@@ -68,17 +68,19 @@ def main() -> int:
         log.info("gerbil will run on CPU (binary was built CPU-only). "
                  "To enable GPU gerbil, reinstall with: python setup.py install --gerbil-gpu")
 
-    cp = None
+    # CuPy is ALWAYS required: create_csr_matrix builds the CSR on the GPU (cp.empty/
+    # cp.zeros_like/cp.asarray) regardless of the gerbil counting backend, and the matrix is
+    # saved with cp.save. So import it unconditionally -- only the GPU probing/monitor below is
+    # gated on gpu_enabled. (Previously cupy was imported only when gpu_enabled, so `-c` runs
+    # left cp=None and crashed at save with "'NoneType' has no attribute 'save'".)
+    try:
+        import cupy as cp  # noqa: F401
+    except Exception as e:
+        log.error("CuPy import failed (required to build and save the CSR): %s", e)
+        return 2
     monitor = None
 
     if gpu_enabled:
-        # Import CuPy only if needed (prevents CPU-only failures on non-GPU systems)
-        try:
-            import cupy as cp  # noqa: F401
-        except Exception as e:
-            log.error("GPU mode requested but CuPy import failed: %s", e)
-            return 2
-
         # Clean up GPU pools before run
         cp.get_default_memory_pool().free_all_blocks()
         gc.collect()
@@ -143,16 +145,14 @@ def main() -> int:
 
     unique_kmers.to_csv(os.path.join(output_dir, f"set_of_all_unique_kmers_{suffix}.csv"), index=False)
 
-    if gpu_enabled:
-        cp.save(os.path.join(output_dir, f"data_{suffix}.npy"), data)
-        cp.save(os.path.join(output_dir, f"row_{suffix}.npy"), row)
-        cp.save(os.path.join(output_dir, f"column_{suffix}.npy"), column)
-    else:
-        # If create_csr_matrix returns NumPy arrays in CPU mode, replace this accordingly.
-        # Example:
-        # import numpy as np
-        # np.save(...)
-        pass
+    # data/row/column are cupy arrays in BOTH modes: create_csr_matrix builds the CSR on the
+    # GPU (cp.empty/cp.zeros_like, cp.asarray(row)) regardless of the gerbil counting backend.
+    # So always persist them. This was previously guarded by `if gpu_enabled:` with an
+    # unimplemented `else: pass`, so `-c` (CPU gerbil) runs computed the matrix but never wrote
+    # data/row/column.npy -- producing no output despite logging "Files saved successfully".
+    cp.save(os.path.join(output_dir, f"data_{suffix}.npy"), data)
+    cp.save(os.path.join(output_dir, f"row_{suffix}.npy"), row)
+    cp.save(os.path.join(output_dir, f"column_{suffix}.npy"), column)
 
     log.info("Files saved successfully in %s", output_dir)
     return 0

@@ -2,8 +2,19 @@ import cudf
 import cupy as cp
 import os
 import subprocess
+import time as _time
 #import cupyx
 from src.run_gerbil import set_of_all_unique_kmers_extractor, single_genome_kmer_extractor
+
+# Env-gated stage profiler (KMX_PROFILE=1). Timing prints only — zero behavior change.
+_PROF = os.environ.get("KMX_PROFILE", "") not in ("", "0")
+
+# Per-genome gerbil runs on CPU by default. GPU gerbil allocates 0.8*free_GPU_mem (~143 GB on a
+# B200) PER invocation (cuda_ds CountingHashTable), which is ruinous in the per-genome loop (one
+# gerbil call per genome). GPU only pays off for the single reference pass over ALL genomes, where
+# that 143 GB table is amortized. So `enable_gpu` (-g) applies to the reference extraction, while
+# the per-genome counting stays on CPU. Set KMX_PERGENOME_GPU=1 to restore the old (slow) behavior.
+_PERGENOME_GPU = os.environ.get("KMX_PERGENOME_GPU", "0") == "1"
 
 
 
@@ -34,7 +45,11 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
     )
     
     # Extract unique k-mers for the provided genome list
+    _t_p1 = _time.time()
     set_of_all_unique_kmers_extractor(genome_list, set_of_all_unique_kmers_dir, kmer_size, min_val, max_val, tmp_dir, disable_normalization,enable_gpu)
+    _prof_pass1 = _time.time() - _t_p1
+    _prof_count = 0.0   # pass-2 per-genome gerbil counting
+    _prof_merge = 0.0   # pass-2 cuDF read + merge + CSR assembly
 
     # Load extracted k-mers into a cuDF DataFrame
     set_of_all_unique_kmers_dataframe = cudf.read_csv(set_of_all_unique_kmers_dir)
@@ -67,7 +82,10 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
             f"{'normalization_disabled' if disable_normalization else 'normalization_enabled'}.csv"
         )
 
-        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, disable_normalization, enable_gpu)
+        _t_c = _time.time()
+        single_genome_kmer_extractor(kmer_size, tmp_dir, tmp_genome_output_dir, genome_dir, disable_normalization, enable_gpu and _PERGENOME_GPU)
+        _prof_count += _time.time() - _t_c
+        _t_m = _time.time()
         df_csv = cudf.read_csv(tmp_genome_output_dir)
         #removing the temporary file
         os.remove(tmp_genome_output_dir)
@@ -92,6 +110,7 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
         data[current_position : current_position + size] = val
         current_position += size
         row.append(current_position)
+        _prof_merge += _time.time() - _t_m
 
         if genome_number % 1000 == 0 and genome_number != 0:
             print(f"Processed {genome_number} genomes", flush=True)
@@ -100,6 +119,12 @@ def create_csr_matrix(genome_list, kmer_size, tmp_dir, min_val=1, max_val=10**9,
             # print(f"Number of non-zero elements so far {current_position}",flush=True)
     
     last_value = row[-1]
+
+    if _PROF:
+        print(f"[KMX1 PROFILE] pass1_count_all={_prof_pass1:.1f}s  "
+              f"pass2_count={_prof_count:.1f}s  pass2_merge={_prof_merge:.1f}s  "
+              f"(genomes={len(genome_dirs)}, cols={len(set_of_all_unique_kmers_dataframe):,})",
+              flush=True)
 
     #Index for each K-mer
     df_comp = set_of_all_unique_kmers_dataframe.reset_index()

@@ -1,4 +1,7 @@
 import os
+import time
+import signal
+import tempfile
 import subprocess
 
 # Find the directory where run_gerbil.py is located
@@ -72,6 +75,67 @@ def _check_gerbil_exists():
         )
 
 
+def _proc_cpu_ticks(pid):
+    """Total CPU (utime+stime) jiffies for the whole process (all threads), or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            # comm may contain spaces/parens; split after the final ')'
+            fields = fh.read().rsplit(")", 1)[1].split()
+        # after comm: state(0) ppid(1) ... utime(11) stime(12)
+        return int(fields[11]) + int(fields[12])
+    except Exception:
+        return None
+
+
+def run_gerbil_watchdog(command, env, *, stall_secs=300, poll_secs=5,
+                        max_attempts=4, label="gerbil"):
+    """Run gerbil with a deadlock watchdog.
+
+    gerbil has an intermittent multithreading deadlock (all threads parked on a
+    futex at 0% CPU -> hangs forever). We monitor the process's cumulative CPU
+    time: a healthy gerbil accrues CPU continuously, a deadlocked one accrues
+    none. If there is NO CPU progress for `stall_secs`, kill the whole process
+    group and retry. Output goes to temp files (never a pipe) so gerbil can't
+    block on a full pipe buffer.
+
+    Returns a subprocess.CompletedProcess; raises CalledProcessError on a genuine
+    non-zero exit, or RuntimeError if it deadlocks on every attempt.
+    """
+    for attempt in range(1, max_attempts + 1):
+        outf, errf = tempfile.TemporaryFile(mode="w+"), tempfile.TemporaryFile(mode="w+")
+        proc = subprocess.Popen(command, env=env, stdout=outf, stderr=errf,
+                                start_new_session=True)  # own pgid for clean tree-kill
+        last_cpu, last_progress, deadlocked = _proc_cpu_ticks(proc.pid), time.time(), False
+        while True:
+            try:
+                proc.wait(timeout=poll_secs)   # returns immediately when gerbil finishes
+                break                          # (fast per-genome calls add no overhead)
+            except subprocess.TimeoutExpired:
+                cur = _proc_cpu_ticks(proc.pid)
+                if cur is not None and cur != last_cpu:
+                    last_cpu, last_progress = cur, time.time()
+                elif time.time() - last_progress > stall_secs:
+                    deadlocked = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    proc.wait()
+                    break
+        outf.seek(0); errf.seek(0)
+        out, err = outf.read(), errf.read(); outf.close(); errf.close()
+        if deadlocked:
+            print(f"Warning: {label} made no CPU progress for {stall_secs}s "
+                  f"(gerbil deadlock); killed process group, retrying "
+                  f"(attempt {attempt}/{max_attempts}).", flush=True)
+            continue
+        if proc.returncode == 0:
+            return subprocess.CompletedProcess(command, 0, out, err)
+        raise subprocess.CalledProcessError(proc.returncode, command, out, err)
+    raise RuntimeError(
+        f"{label} deadlocked on all {max_attempts} attempts: {' '.join(map(str, command))}")
+
+
 def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length, min_threshold, max_threshold, temp_directory, disable_normalization=False, enable_gpu=True):
     """Run the gerbil-DataFrame tool to extract unique k-mers from the given genome file."""
     _check_gerbil_exists()
@@ -92,7 +156,7 @@ def set_of_all_unique_kmers_extractor(genome_file, output_directory, kmer_length
     command.extend([genome_file, temp_directory, output_directory])
 
     try:
-        result = subprocess.run(command, check=True, text=True, capture_output=True, env=_get_gerbil_env())
+        result = run_gerbil_watchdog(command, _get_gerbil_env(), label="gerbil(all-genomes)")
         print(f"Unique k-mers successfully extracted and stored at: {output_directory}")
     except subprocess.CalledProcessError as error:
         print(f"Error: Extraction of unique k-mers failed with return code {error.returncode}.")
@@ -118,7 +182,7 @@ def single_genome_kmer_extractor(kmer_size, tmp_dir, output_file, genome_dir, di
         command.append("-d")
 
     command.extend([genome_dir, tmp_dir, output_file])
-    
-    result = subprocess.run(command, check=True, text=True, capture_output=True, env=_get_gerbil_env())
-    
+
+    result = run_gerbil_watchdog(command, _get_gerbil_env(), label="gerbil(single-genome)")
+
     return output_file
